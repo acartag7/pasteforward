@@ -140,7 +140,7 @@ pub fn set_clipboard_command(
             shell_quote(remote_path)
         )),
         RemoteMode::LinuxX11 => Ok(format!(
-            "{}xclip -selection clipboard -t image/png -i {}",
+            "({}xclip -selection clipboard -t image/png -i {} >/dev/null 2>&1 & sleep 0.2)",
             env_prefix,
             shell_quote(remote_path)
         )),
@@ -181,7 +181,24 @@ fn check_remote_clipboard(dest: &DestinationConfig, remote_mode: &RemoteMode) ->
         RemoteMode::LinuxWayland => {
             format!("{}command -v wl-copy >/dev/null", remote_env_prefix(dest))
         }
-        RemoteMode::LinuxX11 => format!("{}command -v xclip >/dev/null", remote_env_prefix(dest)),
+        RemoteMode::LinuxX11 => {
+            let env_prefix = remote_env_prefix(dest);
+            [
+                "command -v timeout >/dev/null".to_string(),
+                "command -v xclip >/dev/null".to_string(),
+                "payload=pasteforward-doctor-$$".to_string(),
+                format!(
+                    "(printf \"$payload\" | {}xclip -selection clipboard -loops 1 -i >/dev/null 2>&1 &)",
+                    env_prefix
+                ),
+                "sleep 0.2".to_string(),
+                format!(
+                    "test \"$({}timeout 5 xclip -selection clipboard -o 2>/dev/null)\" = \"$payload\"",
+                    env_prefix
+                ),
+            ]
+            .join(" && ")
+        }
         RemoteMode::Auto => return false,
     };
     ssh(&dest.host, &command, None).is_ok()
@@ -228,6 +245,7 @@ mod tests {
         let mut d = dest();
         d.remote_env.insert("DISPLAY".to_string(), ":0".to_string());
         let command = set_clipboard_command(&d, &RemoteMode::LinuxX11, "/tmp/a.png").unwrap();
-        assert!(command.starts_with("DISPLAY=':0' xclip"));
+        assert!(command.contains("DISPLAY=':0' xclip"));
+        assert!(command.contains(">/dev/null 2>&1 & sleep 0.2"));
     }
 }

@@ -104,6 +104,15 @@ make verify
 
 This runs formatting checks, tests, build, and supply-chain checks.
 
+On macOS with Lima installed, run the Linux X11 integration test:
+
+```sh
+scripts/test-lima-x11.sh
+```
+
+That test creates or starts a Lima Ubuntu VM, starts Xvfb, configures `xclip`,
+and verifies local PNG clipboard bytes reach the remote Linux clipboard.
+
 ## Docs
 
 - [Contracts](docs/contracts.md)

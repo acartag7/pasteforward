@@ -38,6 +38,9 @@ PasteForward-generated remote commands are limited to:
 - `mkdir`
 - `chmod`
 - `cat`
+- `printf`
+- `sleep`
+- `timeout`
 - `osascript`
 - `pbcopy`
 - `wl-copy`
