@@ -10,18 +10,47 @@ use pasteforward::service::{
     ServiceStatus, install_service, restart_service_if_installed, service_status, uninstall_service,
 };
 use pasteforward::state::{process_alive, read_pid};
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
+use std::panic;
 
 fn main() {
-    if let Err(err) = run_cli() {
-        eprintln!("pasteforward: {err}");
-        if matches!(err, Error::Usage(_)) {
-            eprintln!();
-            eprintln!("{}", usage());
-        }
-        std::process::exit(1);
+    install_broken_pipe_panic_hook();
+    match panic::catch_unwind(run_cli) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => exit_with_error(err),
+        Err(payload) if panic_payload_is_broken_pipe(payload.as_ref()) => std::process::exit(0),
+        Err(payload) => panic::resume_unwind(payload),
     }
+}
+
+fn exit_with_error(err: Error) -> ! {
+    eprintln!("pasteforward: {err}");
+    if matches!(err, Error::Usage(_)) {
+        eprintln!();
+        eprintln!("{}", usage());
+    }
+    std::process::exit(1);
+}
+
+fn install_broken_pipe_panic_hook() {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if !panic_payload_is_broken_pipe(info.payload()) {
+            default_hook(info);
+        }
+    }));
+}
+
+fn panic_payload_is_broken_pipe(payload: &(dyn Any + Send)) -> bool {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied());
+    message.is_some_and(|value| {
+        value.contains("failed printing to stdout") && value.contains("Broken pipe")
+    })
 }
 
 fn run_cli() -> Result<()> {
@@ -545,5 +574,12 @@ mod tests {
         if !io::stdin().is_terminal() {
             assert!(!prompt_yes_no("Install?", true).unwrap());
         }
+    }
+
+    #[test]
+    fn detects_broken_pipe_print_panic() {
+        let message = "failed printing to stdout: Broken pipe (os error 32)".to_string();
+        assert!(panic_payload_is_broken_pipe(&message));
+        assert!(!panic_payload_is_broken_pipe(&"other panic"));
     }
 }

@@ -44,8 +44,13 @@ PasteForward-generated remote commands are limited to:
 - `osascript`
 - `pbcopy`
 - `wl-copy`
+- `wl-paste`
 - `xclip`
 - `rm -f` only for paths under the configured remote cache
+
+The macOS pasteboard writer runs `osascript -l JavaScript` and uses AppKit to
+publish a pasteboard item with `public.file-url`, `public.png`, and
+`public.tiff` representations for the remote temp image.
 
 `doctor` may suggest package manager commands to the user, but PasteForward does
 not run them.

@@ -22,6 +22,7 @@ target/release/pasteforward
 
 ```sh
 scripts/package-release.sh
+scripts/test-release-tarball.sh
 ```
 
 The script builds with `cargo --locked`, writes a tarball under `dist/`, and
@@ -31,10 +32,26 @@ updates `dist/SHA256SUMS`.
 
 - Release from a clean git tree.
 - Run `make verify`.
+- Run Linux X11 and Wayland integration tests with Lima.
+- Run fan-out, TTL cleanup, service lifecycle, and release tarball smoke tests.
+- Verify real image paste through `pasteforward ssh <dest> -- claude`.
+- Verify real image paste through `pasteforward ssh <dest> -- codex`.
 - Build platform tarballs locally or in CI.
 - Publish SHA-256 checksums with every tarball.
 - Homebrew formula must pin the GitHub Release tarball checksum.
 - Do not add auto-update behavior to the binary.
+
+## Validation Commands
+
+```sh
+make verify
+scripts/test-lima-x11.sh
+scripts/test-lima-wayland.sh
+scripts/test-ttl-cleanup.sh
+scripts/test-fanout.sh
+scripts/test-release-tarball.sh
+PASTEFORWARD_SERVICE_TEST_HOST=user@host scripts/test-service-lifecycle.sh
+```
 
 ## Suggested Artifact Names
 

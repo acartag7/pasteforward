@@ -56,6 +56,10 @@ Supported remote modes:
 
 `auto` detects the remote OS and available clipboard tool over SSH.
 
+For `macos-pasteboard`, PasteForward writes the remote temp PNG to the
+pasteboard as `public.png`, adds `public.tiff` when AppKit can render it, and
+adds a `public.file-url` reference to the same remote temp file.
+
 ## Daemon Contract
 
 The daemon:

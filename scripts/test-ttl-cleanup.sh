@@ -19,22 +19,13 @@ fi
 
 status="$(limactl list 2>/dev/null | awk -v name="$VM_NAME" '$1 == name { print $2 }')"
 if [ -z "$status" ]; then
-  limactl start \
-    --name="$VM_NAME" \
-    --cpus=2 \
-    --memory=2 \
-    --disk=10 \
-    --mount-none \
-    --tty=false \
-    --timeout=20m \
-    template:ubuntu
+  limactl start --name="$VM_NAME" --cpus=2 --memory=2 --disk=10 --mount-none --tty=false --timeout=20m template:ubuntu
 elif [ "$status" != "Running" ]; then
   limactl start --tty=false "$VM_NAME"
 fi
 
 limactl shell "$VM_NAME" sudo apt-get update
 limactl shell "$VM_NAME" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb xclip
-
 limactl shell "$VM_NAME" -- sh -lc "
   rm -f /tmp/.X${DISPLAY_NUM}-lock
   if [ ! -S /tmp/.X11-unix/X${DISPLAY_NUM} ]; then
@@ -48,7 +39,8 @@ tmp="$(mktemp -d)"
 config_home="$tmp/config"
 state_home="$tmp/state"
 test_bin="$tmp/bin"
-png="$tmp/pf-lima-smoke.png"
+png="$tmp/pf-ttl-smoke.png"
+remote_dir="/tmp/pasteforward-ttl-$$"
 prev_img="$tmp/prev.png"
 prev_text="$tmp/prev.txt"
 daemon_pid=""
@@ -92,17 +84,16 @@ if base64 -D </dev/null >/dev/null 2>&1; then
 else
   printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAABlUlEQVR4nA3LQQEAIQgAQStYgQpWsAIVqEAFK1jB9/6oYAUrUIG7+U9rjd6QxmjMhjas4Y3V2I3TiMZtvEY2qtFap3ekMzqzox3reGd1dud0onM7r5Od6n8QuiDCEKagggkuLGELRwjhCk9IoeQPgz6QwRjMgQ5s4IM12IMziMEdvEEOavxh0icyGZM50YlNfLIme3ImMbmTN8lJzT8oXRFlKFNRxRRXlrKVo4RylaekUvoHoxtiDGMaapjhxjK2cYwwrvGMNMr+4HRHnOFMRx1z3FnOdo4TznWek075HxZ9IYuxmAtd2MIXa7EXZxGLu3iLXNT6w6ZvZDM2c6Mb2/hmbfbmbGJzN2+Tm9p/OPSDHMZhHvRgBz+swz6cQxzu4R3yUOcPQQ8kGMEMNLDAgxXs4AQR3OAFGVT84dIvchmXedGLXfyyLvtyLnG5l3fJS90/PPpDHuMxH/qwhz/WYz/OIx738R75qPeHpCeSjGQmmljiyUp2cpJIbvKSTCr/UPRCilHMQgsrvFjFLk4RxS1ekUUVH6hAsxCYFr8vAAAAAElFTkSuQmCC' | base64 -d > "$png"
 fi
-local_sha="$(shasum -a 256 "$png" | awk '{ print $1 }')"
 
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
-  "$BIN" init limavm \
+  "$BIN" init ttlvm \
   --host "lima-$VM_NAME" \
   --remote-mode linux-x11 \
   --remote-env "DISPLAY=$DISPLAY_NAME" \
+  --remote-dir "$remote_dir" \
   --no-install-service
-
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
-  "$BIN" doctor limavm
+  "$BIN" doctor ttlvm
 
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
   "$BIN" daemon >"$tmp/daemon.out" 2>"$tmp/daemon.err" &
@@ -113,7 +104,7 @@ osascript -e "set the clipboard to (read POSIX file \"$png\" as «class PNGf»)"
 
 line=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  line="$(PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" "$BIN" history limavm | tail -n 1 || true)"
+  line="$(PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" "$BIN" history ttlvm | tail -n 1 || true)"
   [ -n "$line" ] && break
   sleep 1
 done
@@ -123,18 +114,16 @@ if [ -z "$line" ]; then
   exit 1
 fi
 
-history_sha="$(printf '%s\n' "$line" | awk '{ print $5 }')"
 remote_path="$(printf '%s\n' "$line" | awk '{ print $6 }')"
-remote_file_sha="$(PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "sha256sum '$remote_path'" | awk '{ print $1 }')"
-remote_clip_sha="$(PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "DISPLAY='$DISPLAY_NAME' timeout 5 xclip -selection clipboard -t image/png -o 2>/dev/null | sha256sum" | awk '{ print $1 }')"
+PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "test -s '$remote_path'"
 
-printf 'local_sha=%s\n' "$local_sha"
-printf 'history_sha=%s\n' "$history_sha"
-printf 'remote_path=%s\n' "$remote_path"
-printf 'remote_file_sha=%s\n' "$remote_file_sha"
-printf 'remote_clip_sha=%s\n' "$remote_clip_sha"
-cat "$tmp/daemon.err"
+perl -0pi -e 's/"ttl_seconds":\s*\d+/"ttl_seconds": 0/' "$config_home/config.json"
+PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
+  "$BIN" cleanup ttlvm
 
-test "$history_sha" = "$local_sha"
-test "$remote_file_sha" = "$local_sha"
-test "$remote_clip_sha" = "$local_sha"
+if PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "test -e '$remote_path'"; then
+  echo "remote file still exists after cleanup: $remote_path" >&2
+  exit 1
+fi
+
+printf 'ttl_cleanup_removed=%s\n' "$remote_path"

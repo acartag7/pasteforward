@@ -39,8 +39,8 @@ pasteforward init devbox \
   --remote-env DISPLAY=:0
 ```
 
-PasteForward does not install `wl-copy` or `xclip`. `doctor` reports missing
-tools and leaves package installation to the operator.
+PasteForward does not install `wl-copy`, `wl-paste`, or `xclip`. `doctor`
+reports missing tools and leaves package installation to the operator.
 
 ## Check Health
 

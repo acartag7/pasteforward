@@ -13,7 +13,7 @@ V0 supports:
 - local macOS
 - local Linux with `wl-paste` or `xclip`
 - remote macOS with `osascript` and `pbcopy`
-- remote Linux GUI sessions with `wl-copy` or `xclip`
+- remote Linux GUI sessions with `wl-copy`/`wl-paste` or `xclip`
 - one local daemon that handles all enabled destinations
 - JSON config
 - metadata history by default
@@ -104,14 +104,31 @@ make verify
 
 This runs formatting checks, tests, build, and supply-chain checks.
 
-On macOS with Lima installed, run the Linux X11 integration test:
+On macOS with Lima installed, run the Linux integration tests:
 
 ```sh
 scripts/test-lima-x11.sh
+scripts/test-lima-wayland.sh
 ```
 
-That test creates or starts a Lima Ubuntu VM, starts Xvfb, configures `xclip`,
-and verifies local PNG clipboard bytes reach the remote Linux clipboard.
+Those tests create or start a Lima Ubuntu VM and verify local PNG clipboard
+bytes reach remote X11 and Wayland clipboards.
+
+Additional release smoke checks:
+
+```sh
+scripts/test-ttl-cleanup.sh
+scripts/test-fanout.sh
+scripts/test-release-tarball.sh
+PASTEFORWARD_SERVICE_TEST_HOST=user@host scripts/test-service-lifecycle.sh
+```
+
+Before release, also run the real terminal-agent path:
+
+```sh
+pasteforward ssh macmini -- claude
+pasteforward ssh macmini -- codex
+```
 
 ## Docs
 

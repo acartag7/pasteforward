@@ -52,6 +52,25 @@ pub fn applescript_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+pub fn javascript_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn ssh(host: &str, remote_command: &str, input: Option<&[u8]>) -> Result<CommandOutput> {
     let args = vec![host.to_string(), remote_command.to_string()];
     run("ssh", &args, input)
@@ -87,5 +106,10 @@ mod tests {
     #[test]
     fn quotes_applescript_strings() {
         assert_eq!(applescript_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn quotes_javascript_strings() {
+        assert_eq!(javascript_string("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
     }
 }

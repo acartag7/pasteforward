@@ -1,8 +1,11 @@
 use crate::command::run;
 use crate::config::{config_dir, state_dir};
 use crate::error::{Error, Result};
+use crate::state::{pid_path, process_alive, read_pid};
 use std::fs;
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 const MAC_LABEL: &str = "io.github.acartag7.pasteforward";
 const LINUX_UNIT: &str = "pasteforward.service";
@@ -37,6 +40,7 @@ pub fn uninstall_service() -> Result<()> {
             ],
             None,
         );
+        stop_recorded_daemon()?;
         if plist.exists() {
             fs::remove_file(plist)?;
         }
@@ -71,19 +75,7 @@ pub fn restart_service_if_installed() -> Result<()> {
     match service_status()? {
         ServiceStatus::Installed => {
             if cfg!(target_os = "macos") {
-                let plist = launch_agent_path()?;
-                let _ = run(
-                    "launchctl",
-                    &[
-                        "kickstart".to_string(),
-                        "-k".to_string(),
-                        format!("gui/{}/{}", unsafe { libc_getuid() }, MAC_LABEL),
-                    ],
-                    None,
-                );
-                if !plist.exists() {
-                    install_launch_agent()?;
-                }
+                install_launch_agent()?;
             } else if cfg!(target_os = "linux") {
                 let _ = run(
                     "systemctl",
@@ -165,6 +157,7 @@ fn install_launch_agent() -> Result<()> {
         ],
         None,
     );
+    stop_recorded_daemon()?;
     run(
         "launchctl",
         &[
@@ -174,16 +167,61 @@ fn install_launch_agent() -> Result<()> {
         ],
         None,
     )?;
-    run(
-        "launchctl",
-        &[
-            "kickstart".to_string(),
-            "-k".to_string(),
-            format!("gui/{}/{}", unsafe { libc_getuid() }, MAC_LABEL),
-        ],
-        None,
-    )?;
     Ok(())
+}
+
+fn stop_recorded_daemon() -> Result<()> {
+    let Some(pid) = read_pid()? else {
+        return Ok(());
+    };
+
+    if process_alive(pid) {
+        terminate_process(pid)?;
+        for _ in 0..50 {
+            if !process_alive(pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    if process_alive(pid) {
+        return Err(Error::DoctorFailed(format!(
+            "pasteforward daemon did not stop after SIGTERM: pid {pid}"
+        )));
+    }
+
+    let path = pid_path()?;
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) -> Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    let rc = unsafe { kill(pid as i32, 15) };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(3) {
+        Ok(())
+    } else {
+        Err(err.into())
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process(_pid: u32) -> Result<()> {
+    Err(Error::UnsupportedPlatform(
+        "service process termination is only supported on Unix".to_string(),
+    ))
 }
 
 fn install_systemd_user() -> Result<()> {

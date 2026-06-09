@@ -1,5 +1,5 @@
 use crate::clipboard::detect_local_backend;
-use crate::command::{applescript_string, shell_quote, ssh};
+use crate::command::{javascript_string, shell_quote, ssh};
 use crate::config::{AppConfig, DestinationConfig, RemoteMode};
 use crate::error::{Error, Result};
 
@@ -129,13 +129,35 @@ pub fn set_clipboard_command(
     match remote_mode {
         RemoteMode::MacosPasteboard => {
             let script = format!(
-                "set the clipboard to (read POSIX file {} as «class PNGf»)",
-                applescript_string(remote_path)
+                concat!(
+                    "ObjC.import(\"AppKit\");",
+                    "ObjC.import(\"Foundation\");",
+                    "const path = {};",
+                    "const png = $.NSData.dataWithContentsOfFile(path);",
+                    "if (!png) throw new Error(\"failed to read png\");",
+                    "const image = $.NSImage.alloc.initWithData(png);",
+                    "if (!image) throw new Error(\"failed to load image\");",
+                    "const item = $.NSPasteboardItem.alloc.init;",
+                    "const url = $.NSURL.fileURLWithPath(path);",
+                    "item.setStringForType(url.absoluteString, \"public.file-url\");",
+                    "item.setDataForType(png, \"public.png\");",
+                    "const tiff = image.TIFFRepresentation;",
+                    "if (tiff && tiff.length > 0) item.setDataForType(tiff, \"public.tiff\");",
+                    "const objects = $.NSMutableArray.arrayWithCapacity(1);",
+                    "objects.addObject(item);",
+                    "const pasteboard = $.NSPasteboard.generalPasteboard;",
+                    "pasteboard.clearContents;",
+                    "if (!pasteboard.writeObjects(objects)) throw new Error(\"failed to write pasteboard\");"
+                ),
+                javascript_string(remote_path)
             );
-            Ok(format!("/usr/bin/osascript -e {}", shell_quote(&script)))
+            Ok(format!(
+                "/usr/bin/osascript -l JavaScript -e {}",
+                shell_quote(&script)
+            ))
         }
         RemoteMode::LinuxWayland => Ok(format!(
-            "{}wl-copy --type image/png < {}",
+            "({}wl-copy --type image/png < {} >/dev/null 2>&1 & sleep 0.2)",
             env_prefix,
             shell_quote(remote_path)
         )),
@@ -175,11 +197,33 @@ pub fn local_doctor_problem() -> Option<String> {
 fn check_remote_clipboard(dest: &DestinationConfig, remote_mode: &RemoteMode) -> bool {
     let command = match remote_mode {
         RemoteMode::MacosPasteboard => {
-            "command -v /usr/bin/osascript >/dev/null && command -v /usr/bin/pbcopy >/dev/null"
-                .to_string()
+            concat!(
+                "command -v /usr/bin/osascript >/dev/null",
+                " && command -v /usr/bin/pbcopy >/dev/null",
+                " && /usr/bin/osascript -l JavaScript -e ",
+                "'ObjC.import(\"AppKit\");ObjC.import(\"Foundation\");$.NSPasteboard.generalPasteboard;'",
+                " >/dev/null"
+            )
+            .to_string()
         }
         RemoteMode::LinuxWayland => {
-            format!("{}command -v wl-copy >/dev/null", remote_env_prefix(dest))
+            let env_prefix = remote_env_prefix(dest);
+            [
+                "command -v timeout >/dev/null".to_string(),
+                "command -v wl-copy >/dev/null".to_string(),
+                "command -v wl-paste >/dev/null".to_string(),
+                "payload=pasteforward-doctor-$$".to_string(),
+                format!(
+                    "(printf \"$payload\" | {}wl-copy --paste-once --type text/plain >/dev/null 2>&1 &)",
+                    env_prefix
+                ),
+                "sleep 0.2".to_string(),
+                format!(
+                    "test \"$({}timeout 5 wl-paste --type text/plain 2>/dev/null)\" = \"$payload\"",
+                    env_prefix
+                ),
+            ]
+            .join(" && ")
         }
         RemoteMode::LinuxX11 => {
             let env_prefix = remote_env_prefix(dest);
@@ -237,6 +281,10 @@ mod tests {
         let command =
             set_clipboard_command(&dest(), &RemoteMode::MacosPasteboard, "/tmp/a b.png").unwrap();
         assert!(command.contains("/usr/bin/osascript"));
+        assert!(command.contains("-l JavaScript"));
+        assert!(command.contains("public.file-url"));
+        assert!(command.contains("public.png"));
+        assert!(command.contains("public.tiff"));
         assert!(command.contains("/tmp/a b.png"));
     }
 
@@ -246,6 +294,16 @@ mod tests {
         d.remote_env.insert("DISPLAY".to_string(), ":0".to_string());
         let command = set_clipboard_command(&d, &RemoteMode::LinuxX11, "/tmp/a.png").unwrap();
         assert!(command.contains("DISPLAY=':0' xclip"));
+        assert!(command.contains(">/dev/null 2>&1 & sleep 0.2"));
+    }
+
+    #[test]
+    fn builds_wayland_detached_clipboard_command() {
+        let mut d = dest();
+        d.remote_env
+            .insert("WAYLAND_DISPLAY".to_string(), "wayland-1".to_string());
+        let command = set_clipboard_command(&d, &RemoteMode::LinuxWayland, "/tmp/a.png").unwrap();
+        assert!(command.contains("WAYLAND_DISPLAY='wayland-1' wl-copy"));
         assert!(command.contains(">/dev/null 2>&1 & sleep 0.2"));
     }
 }

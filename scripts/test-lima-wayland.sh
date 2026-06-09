@@ -5,8 +5,6 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 REAL_HOME="${HOME:?}"
 VM_NAME="${PASTEFORWARD_LIMA_VM:-pasteforward-linux}"
 BIN="${PASTEFORWARD_BIN:-$ROOT/target/release/pasteforward}"
-DISPLAY_NAME="${PASTEFORWARD_LIMA_DISPLAY:-:99}"
-DISPLAY_NUM="${DISPLAY_NAME#:}"
 
 if ! command -v limactl >/dev/null 2>&1; then
   echo "limactl is required" >&2
@@ -33,22 +31,36 @@ elif [ "$status" != "Running" ]; then
 fi
 
 limactl shell "$VM_NAME" sudo apt-get update
-limactl shell "$VM_NAME" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb xclip
+limactl shell "$VM_NAME" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends sway wl-clipboard
 
-limactl shell "$VM_NAME" -- sh -lc "
-  rm -f /tmp/.X${DISPLAY_NUM}-lock
-  if [ ! -S /tmp/.X11-unix/X${DISPLAY_NUM} ]; then
-    nohup Xvfb '$DISPLAY_NAME' -ac -screen 0 1280x720x24 >/tmp/pasteforward-xvfb.log 2>&1 &
-    sleep 2
+uid="$(limactl shell "$VM_NAME" id -u | tr -d '\r')"
+runtime_dir="/run/user/$uid"
+wayland_display="$(limactl shell "$VM_NAME" -- sh -lc "
+  set -eu
+  export XDG_RUNTIME_DIR='$runtime_dir'
+  mkdir -p \"\$XDG_RUNTIME_DIR\"
+  chmod 700 \"\$XDG_RUNTIME_DIR\"
+  if ! pgrep -x sway >/dev/null 2>&1; then
+    cat >/tmp/pasteforward-sway.conf <<'EOF'
+output * resolution 800x600
+EOF
+    WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 nohup sway -c /tmp/pasteforward-sway.conf >/tmp/pasteforward-sway.log 2>&1 &
+    sleep 5
   fi
-  DISPLAY='$DISPLAY_NAME' xclip -version >/dev/null
-"
+  ls \"\$XDG_RUNTIME_DIR\" | grep -E '^wayland-[0-9]+$' | tail -n 1
+" | tr -d '\r')"
+
+if [ -z "$wayland_display" ]; then
+  echo "failed to start a headless Wayland compositor" >&2
+  limactl shell "$VM_NAME" -- sh -lc 'cat /tmp/pasteforward-sway.log 2>/dev/null || true' >&2
+  exit 1
+fi
 
 tmp="$(mktemp -d)"
 config_home="$tmp/config"
 state_home="$tmp/state"
 test_bin="$tmp/bin"
-png="$tmp/pf-lima-smoke.png"
+png="$tmp/pf-lima-wayland-smoke.png"
 prev_img="$tmp/prev.png"
 prev_text="$tmp/prev.txt"
 daemon_pid=""
@@ -95,14 +107,15 @@ fi
 local_sha="$(shasum -a 256 "$png" | awk '{ print $1 }')"
 
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
-  "$BIN" init limavm \
+  "$BIN" init limawayland \
   --host "lima-$VM_NAME" \
-  --remote-mode linux-x11 \
-  --remote-env "DISPLAY=$DISPLAY_NAME" \
+  --remote-mode linux-wayland \
+  --remote-env "WAYLAND_DISPLAY=$wayland_display" \
+  --remote-env "XDG_RUNTIME_DIR=$runtime_dir" \
   --no-install-service
 
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
-  "$BIN" doctor limavm
+  "$BIN" doctor limawayland
 
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
   "$BIN" daemon >"$tmp/daemon.out" 2>"$tmp/daemon.err" &
@@ -113,7 +126,7 @@ osascript -e "set the clipboard to (read POSIX file \"$png\" as «class PNGf»)"
 
 line=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  line="$(PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" "$BIN" history limavm | tail -n 1 || true)"
+  line="$(PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" "$BIN" history limawayland | tail -n 1 || true)"
   [ -n "$line" ] && break
   sleep 1
 done
@@ -126,8 +139,9 @@ fi
 history_sha="$(printf '%s\n' "$line" | awk '{ print $5 }')"
 remote_path="$(printf '%s\n' "$line" | awk '{ print $6 }')"
 remote_file_sha="$(PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "sha256sum '$remote_path'" | awk '{ print $1 }')"
-remote_clip_sha="$(PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "DISPLAY='$DISPLAY_NAME' timeout 5 xclip -selection clipboard -t image/png -o 2>/dev/null | sha256sum" | awk '{ print $1 }')"
+remote_clip_sha="$(PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "XDG_RUNTIME_DIR='$runtime_dir' WAYLAND_DISPLAY='$wayland_display' timeout 5 wl-paste --type image/png 2>/dev/null | sha256sum" | awk '{ print $1 }')"
 
+printf 'wayland_display=%s\n' "$wayland_display"
 printf 'local_sha=%s\n' "$local_sha"
 printf 'history_sha=%s\n' "$history_sha"
 printf 'remote_path=%s\n' "$remote_path"
