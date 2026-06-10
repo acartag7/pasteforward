@@ -1,4 +1,3 @@
-use pasteforward::command::{shell_quote, ssh_interactive};
 use pasteforward::config::{
     AppConfig, DestinationConfig, RemoteMode, load_config, save_config, validate_destination_name,
 };
@@ -67,7 +66,6 @@ fn run_cli() -> Result<()> {
         "list" => cmd_list(args),
         "history" => cmd_history(args),
         "cleanup" => cmd_cleanup(args),
-        "ssh" => cmd_ssh(args),
         "install-service" => cmd_init(args),
         "uninstall-service" => cmd_delete(args),
         "daemon" => run_daemon(),
@@ -335,119 +333,6 @@ fn cmd_cleanup(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ssh(args: Vec<String>) -> Result<()> {
-    if args.is_empty() {
-        return Err(Error::Usage(
-            "usage: pasteforward ssh <dest> [--install-service|--no-service] [--] [remote command...]"
-                .to_string(),
-        ));
-    }
-
-    let dest_name = args[0].clone();
-    validate_destination_name(&dest_name)?;
-    let mut ensure_service = true;
-    let mut force_install_service = false;
-    let mut command_args = Vec::new();
-    let mut saw_separator = false;
-    let mut i = 1;
-    while i < args.len() {
-        if saw_separator {
-            command_args.push(args[i].clone());
-        } else {
-            match args[i].as_str() {
-                "--no-service" => ensure_service = false,
-                "--install-service" => force_install_service = true,
-                "--" => saw_separator = true,
-                other => {
-                    return Err(Error::Usage(format!(
-                        "unknown ssh option before --: {other}"
-                    )));
-                }
-            }
-        }
-        i += 1;
-    }
-    if !ensure_service && force_install_service {
-        return Err(Error::Usage(
-            "--install-service and --no-service cannot be used together".to_string(),
-        ));
-    }
-
-    let config = load_config()?;
-    let dest = config
-        .destinations
-        .get(&dest_name)
-        .ok_or_else(|| Error::MissingDestination(dest_name.clone()))?;
-    if !dest.enabled {
-        return Err(Error::DoctorFailed(format!(
-            "destination is disabled: {dest_name}"
-        )));
-    }
-
-    if let Some(problem) = local_doctor_problem() {
-        return Err(Error::DoctorFailed(format!(
-            "local clipboard is not ready: {problem}"
-        )));
-    }
-
-    if ensure_service {
-        match service_status()? {
-            ServiceStatus::Installed => restart_service_if_installed()?,
-            ServiceStatus::NotInstalled => {
-                if force_install_service
-                    || prompt_yes_no("Install the PasteForward background service now?", true)?
-                {
-                    install_service()?;
-                    println!("service installed and running");
-                } else {
-                    println!("service install skipped");
-                }
-            }
-            ServiceStatus::Unknown(message) => {
-                println!("service status unknown: {message}");
-            }
-        }
-    }
-
-    let report = doctor_destination(&config, &dest_name, dest);
-    if !report.ok() {
-        print_doctor(&report);
-        return Err(Error::DoctorFailed(format!(
-            "doctor failed for {dest_name}"
-        )));
-    }
-
-    let remote_command = if command_args.is_empty() {
-        None
-    } else {
-        Some(remote_login_shell_command(&command_args))
-    };
-    let code = ssh_interactive(&dest.host, remote_command.as_deref())?;
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(Error::CommandFailed {
-            program: "ssh".to_string(),
-            args: vec![dest.host.clone()],
-            code: Some(code),
-            stderr: String::new(),
-        })
-    }
-}
-
-fn remote_login_shell_command(command_args: &[String]) -> String {
-    let command = command_args
-        .iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        r#"shell="${{SHELL:-/bin/sh}}"; case "$shell" in *zsh|*bash) exec "$shell" -ilc {} ;; *) exec "$shell" -lc {} ;; esac"#,
-        shell_quote(&command),
-        shell_quote(&command)
-    )
-}
-
 fn print_doctor(report: &pasteforward::doctor::DestinationDoctor) {
     println!("destination: {}", report.name);
     println!("  host: {}", report.host);
@@ -530,7 +415,6 @@ fn usage() -> &'static str {
   pasteforward list
   pasteforward history [dest]
   pasteforward cleanup [dest]
-  pasteforward ssh <dest> [--install-service|--no-service] [--] [remote command...]
   pasteforward install-service <dest> --host <ssh-host> [options]
   pasteforward uninstall-service <dest> [--purge]
   pasteforward daemon
@@ -551,23 +435,6 @@ Init options:
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn remote_login_shell_preserves_command_arguments() {
-        let command = remote_login_shell_command(&[
-            "claude".to_string(),
-            "--model".to_string(),
-            "x y".to_string(),
-        ]);
-        let payload = ["claude", "--model", "x y"]
-            .iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(command.contains("${SHELL:-/bin/sh}"));
-        assert!(command.contains(&shell_quote(&payload)));
-        assert!(command.contains("-ilc"));
-    }
 
     #[test]
     fn non_interactive_prompt_does_not_default_to_yes() {

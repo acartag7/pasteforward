@@ -64,14 +64,6 @@ PasteForward runs locally in the background. It watches your local image
 clipboard and updates the configured remote clipboard, so the remote agent keeps
 using its normal paste flow.
 
-`pasteforward ssh` is optional. Use it when you want PasteForward to run checks
-and open the SSH session for you:
-
-```sh
-pasteforward ssh macmini -- claude
-pasteforward ssh macmini -- codex
-```
-
 For non-interactive setup, make service installation explicit:
 
 ```sh

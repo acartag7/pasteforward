@@ -35,8 +35,8 @@ tarballs for x86_64 and arm64, uploads per-tarball SHA-256 files, then
 publishes the release after all uploads pass:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 The tag must match the Cargo package version as `v<version>`.
@@ -49,7 +49,6 @@ The tag must match the Cargo package version as `v<version>`.
 - Run fan-out, TTL cleanup, service lifecycle, and release tarball smoke tests.
 - Verify real image paste in a normal SSH session with `claude`.
 - Verify real image paste in a normal SSH session with `codex`.
-- Smoke-test the optional `pasteforward ssh <dest> -- <command>` wrapper.
 - Build platform tarballs locally or in CI.
 - Publish SHA-256 checksums with every tarball.
 - Homebrew formula must pin the GitHub Release tarball checksum.
@@ -70,12 +69,12 @@ PASTEFORWARD_SERVICE_TEST_HOST=user@host scripts/test-service-lifecycle.sh
 ## Suggested Artifact Names
 
 ```text
-pasteforward-v0.1.0-aarch64-apple-darwin.tar.gz
-pasteforward-v0.1.0-x86_64-apple-darwin.tar.gz
-pasteforward-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-pasteforward-v0.1.0-aarch64-unknown-linux-gnu.tar.gz
-pasteforward-v0.1.0-aarch64-apple-darwin.tar.gz.sha256
-pasteforward-v0.1.0-x86_64-apple-darwin.tar.gz.sha256
-pasteforward-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-pasteforward-v0.1.0-aarch64-unknown-linux-gnu.tar.gz.sha256
+pasteforward-v0.1.1-aarch64-apple-darwin.tar.gz
+pasteforward-v0.1.1-x86_64-apple-darwin.tar.gz
+pasteforward-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
+pasteforward-v0.1.1-aarch64-unknown-linux-gnu.tar.gz
+pasteforward-v0.1.1-aarch64-apple-darwin.tar.gz.sha256
+pasteforward-v0.1.1-x86_64-apple-darwin.tar.gz.sha256
+pasteforward-v0.1.1-x86_64-unknown-linux-gnu.tar.gz.sha256
+pasteforward-v0.1.1-aarch64-unknown-linux-gnu.tar.gz.sha256
 ```

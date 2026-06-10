@@ -76,24 +76,6 @@ pub fn ssh(host: &str, remote_command: &str, input: Option<&[u8]>) -> Result<Com
     run("ssh", &args, input)
 }
 
-pub fn ssh_interactive(host: &str, remote_command: Option<&str>) -> Result<i32> {
-    let mut args = vec!["-t".to_string(), host.to_string()];
-    if let Some(command) = remote_command {
-        args.push(command.to_string());
-    }
-    run_interactive("ssh", &args)
-}
-
-pub fn run_interactive(program: &str, args: &[String]) -> Result<i32> {
-    let status = Command::new(program)
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
-    Ok(status.code().unwrap_or(1))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

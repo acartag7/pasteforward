@@ -7,6 +7,7 @@ RESTORE_DEST="${PASTEFORWARD_SERVICE_RESTORE_DEST:-macmini}"
 RESTORE_HOST="${PASTEFORWARD_SERVICE_RESTORE_HOST:-$TEST_HOST}"
 CONFIG_PATH="${PASTEFORWARD_SERVICE_CONFIG_PATH:-$HOME/.config/pasteforward/config.json}"
 CONFIG_DIR="$(dirname "$CONFIG_PATH")"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/io.github.acartag7.pasteforward.plist"
 
 if [ ! -x "$BIN" ]; then
   echo "pasteforward binary not executable: $BIN" >&2
@@ -23,6 +24,7 @@ if [ -f "$CONFIG_PATH" ]; then
 fi
 
 service_was_installed=0
+restore_bin="$BIN"
 status_has() {
   "$BIN" status > "$status_out"
   grep -q "$1" "$status_out"
@@ -30,6 +32,12 @@ status_has() {
 
 if status_has '^service: installed$'; then
   service_was_installed=1
+  if [ -f "$LAUNCHD_PLIST" ]; then
+    detected_bin="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$LAUNCHD_PLIST" 2>/dev/null || true)"
+    if [ -n "$detected_bin" ] && [ -x "$detected_bin" ]; then
+      restore_bin="$detected_bin"
+    fi
+  fi
 fi
 
 restore() {
@@ -41,7 +49,7 @@ restore() {
   fi
 
   if [ "$service_was_installed" -eq 1 ]; then
-    "$BIN" init "$RESTORE_DEST" --host "$RESTORE_HOST" --yes >/dev/null || true
+    "$restore_bin" init "$RESTORE_DEST" --host "$RESTORE_HOST" --yes >/dev/null || true
   else
     "$BIN" uninstall-service "$RESTORE_DEST" >/dev/null 2>&1 || true
   fi

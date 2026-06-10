@@ -75,23 +75,6 @@ The daemon does not sync clipboard text.
 Only one daemon should run for a user. Startup refuses to replace a live daemon
 pid and overwrites stale pid files.
 
-## SSH Wrapper Contract
-
-The SSH wrapper is optional. Image forwarding is owned by the local daemon and
-continues to work for normal `ssh` sessions.
-
-`pasteforward ssh <dest> -- <command...>`:
-
-- uses the configured destination host
-- checks local clipboard readiness
-- checks the destination with `doctor`
-- opens SSH with a TTY
-- runs the command through the remote login shell
-
-If the background service is not installed, interactive runs ask before
-installing it. Non-interactive runs require `--install-service` or a prior
-`init --yes`.
-
 ## History Contract
 
 Metadata history is JSONL:
