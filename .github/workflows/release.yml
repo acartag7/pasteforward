@@ -12,6 +12,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  GH_REPO: ${{ github.repository }}
+
 jobs:
   validate:
     runs-on: ubuntu-24.04
