@@ -55,10 +55,11 @@ publish a pasteboard item with `public.file-url`, `public.png`, and
 `doctor` may suggest package manager commands to the user, but PasteForward does
 not run them.
 
-`pasteforward ssh <dest> -- <command...>` intentionally runs the user-provided
-command through SSH on the configured destination. The clipboard-command
-allowlist above applies to PasteForward-generated clipboard and cleanup
-commands, not to commands the operator explicitly passes after `--`.
+`pasteforward ssh <dest> -- <command...>` is an optional convenience wrapper.
+When used, it intentionally runs the user-provided command through SSH on the
+configured destination. The clipboard-command allowlist above applies to
+PasteForward-generated clipboard and cleanup commands, not to commands the
+operator explicitly passes after `--`.
 
 ## Release Rules
 

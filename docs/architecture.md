@@ -9,7 +9,7 @@ PasteForward is a single Rust binary with a small module boundary:
 - `history`: metadata JSONL and optional image cache
 - `service`: launchd/systemd user service installation
 - `command`: process and SSH execution helpers
-- CLI `ssh`: starts configured remote agent sessions through SSH
+- CLI `ssh`: optional preflight wrapper for remote agent sessions
 
 ## Runtime Model
 
@@ -30,10 +30,14 @@ Adding or deleting a destination updates config and restarts the service if it i
 installed. The daemon also reloads config on every poll loop, so config changes
 are picked up without a schema migration step.
 
+Plain SSH sessions work after the daemon is running; the remote terminal agent
+does not need to be launched through PasteForward.
+
 The `pasteforward ssh <dest> -- claude` and `pasteforward ssh <dest> -- codex`
-commands do not create per-destination daemons. They validate the selected
-destination, ensure the local service is available when explicitly allowed, run
-doctor checks, and then attach an SSH TTY to the configured host.
+commands are convenience wrappers. They do not create per-destination daemons.
+They validate the selected destination, ensure the local service is available
+when explicitly allowed, run doctor checks, and then attach an SSH TTY to the
+configured host.
 
 ## Remote Cache
 

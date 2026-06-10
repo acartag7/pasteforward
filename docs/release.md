@@ -47,8 +47,9 @@ The tag must match the Cargo package version as `v<version>`.
 - Run `make verify`.
 - Run Linux X11 and Wayland integration tests with Lima.
 - Run fan-out, TTL cleanup, service lifecycle, and release tarball smoke tests.
-- Verify real image paste through `pasteforward ssh <dest> -- claude`.
-- Verify real image paste through `pasteforward ssh <dest> -- codex`.
+- Verify real image paste in a normal SSH session with `claude`.
+- Verify real image paste in a normal SSH session with `codex`.
+- Smoke-test the optional `pasteforward ssh <dest> -- <command>` wrapper.
 - Build platform tarballs locally or in CI.
 - Publish SHA-256 checksums with every tarball.
 - Homebrew formula must pin the GitHub Release tarball checksum.

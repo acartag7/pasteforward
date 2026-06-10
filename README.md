@@ -54,19 +54,29 @@ pasteforward init macmini --host acartagena@arnolds-mac-mini.tail46d819.ts.net
 `init` writes config, runs doctor checks, then asks whether to install or restart
 the local background service. The default answer is yes.
 
-Use Claude or Codex over SSH as usual:
+Then use your normal SSH session. PasteForward keeps forwarding images in the
+background:
+
+```sh
+ssh acartagena@arnolds-mac-mini.tail46d819.ts.net
+claude
+```
+
+Copy a screenshot locally, focus the remote terminal, and press the normal image
+paste shortcut used by the remote tool. The daemon updates the remote clipboard;
+the terminal agent does not need to know PasteForward exists.
+
+Optional convenience wrapper:
 
 ```sh
 pasteforward ssh macmini -- claude
 pasteforward ssh macmini -- codex
 ```
 
-Copy a screenshot locally, focus the remote terminal, and press the normal image
-paste shortcut used by the remote tool.
-
-`pasteforward ssh` checks the destination, makes sure the local service is
-running when possible, then opens SSH with a TTY. Remote commands run through the
-remote login shell so user-installed `claude` or `codex` binaries are found.
+`pasteforward ssh` is not required for paste forwarding. It checks the
+destination, makes sure the local service is running when possible, then opens
+SSH with a TTY. Remote commands run through the remote login shell so
+user-installed `claude` or `codex` binaries are found.
 
 ## Commands
 
@@ -87,10 +97,16 @@ pasteforward --version
 
 `daemon` is mostly for debugging. Normal users should start it through `init`.
 
-Non-interactive service installation requires an explicit flag:
+Non-interactive service setup requires an explicit flag:
 
 ```sh
 pasteforward init macmini --host acartagena@arnolds-mac-mini.tail46d819.ts.net --yes
+```
+
+If automation uses the optional SSH wrapper before the service exists, it must
+also opt in explicitly:
+
+```sh
 pasteforward ssh macmini --install-service -- claude
 ```
 
@@ -135,7 +151,14 @@ scripts/test-release-tarball.sh
 PASTEFORWARD_SERVICE_TEST_HOST=user@host scripts/test-service-lifecycle.sh
 ```
 
-Before release, also run the real terminal-agent path:
+Before release, also run the real terminal-agent path over a normal SSH session.
+The wrapper path is a separate convenience smoke check:
+
+```sh
+ssh acartagena@arnolds-mac-mini.tail46d819.ts.net
+claude
+codex
+```
 
 ```sh
 pasteforward ssh macmini -- claude

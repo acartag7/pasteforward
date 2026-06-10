@@ -77,6 +77,9 @@ pid and overwrites stale pid files.
 
 ## SSH Wrapper Contract
 
+The SSH wrapper is optional. Image forwarding is owned by the local daemon and
+continues to work for normal `ssh` sessions.
+
 `pasteforward ssh <dest> -- <command...>`:
 
 - uses the configured destination host

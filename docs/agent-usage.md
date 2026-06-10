@@ -4,7 +4,23 @@ PasteForward is meant to be boring to use from terminal agents.
 
 ## Start A Remote Agent
 
-After a destination exists:
+After a destination exists and the local service is installed, use the same SSH
+flow you already use:
+
+```sh
+ssh acartagena@arnolds-mac-mini.tail46d819.ts.net
+claude
+# or: codex
+```
+
+PasteForward forwards image clipboard changes in the background. Claude Code,
+Codex, or any other terminal agent keeps using its normal paste path on the
+remote machine.
+
+## Optional SSH Wrapper
+
+The wrapper is useful when an agent or script wants PasteForward to do preflight
+checks before opening SSH:
 
 ```sh
 pasteforward ssh macmini -- claude
@@ -21,6 +37,9 @@ The wrapper:
 - opens SSH with a TTY
 - executes the requested command through the remote login shell
 
+The wrapper is not required for image forwarding. Once the daemon is running,
+plain `ssh` sessions work.
+
 ## Non-Interactive Agent Setup
 
 Use explicit service consent in non-interactive sessions:
@@ -31,7 +50,13 @@ pasteforward init macmini \
   --yes
 ```
 
-Then run:
+Then run your normal SSH session, or use the wrapper if you want preflight
+checks:
+
+```sh
+ssh acartagena@arnolds-mac-mini.tail46d819.ts.net
+claude
+```
 
 ```sh
 pasteforward ssh macmini -- claude
