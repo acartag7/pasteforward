@@ -35,8 +35,8 @@ tarballs for x86_64 and arm64, uploads per-tarball SHA-256 files, then
 publishes the release after all uploads pass:
 
 ```sh
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 The tag must match the Cargo package version as `v<version>`.
@@ -63,18 +63,20 @@ scripts/test-lima-wayland.sh
 scripts/test-ttl-cleanup.sh
 scripts/test-fanout.sh
 scripts/test-release-tarball.sh
-PASTEFORWARD_SERVICE_TEST_HOST=user@host scripts/test-service-lifecycle.sh
+PASTEFORWARD_SERVICE_TEST_HOST=user@host \
+  PASTEFORWARD_SERVICE_RESTORE_BIN="$HOME/.local/bin/pasteforward" \
+  scripts/test-service-lifecycle.sh
 ```
 
 ## Suggested Artifact Names
 
 ```text
-pasteforward-v0.1.1-aarch64-apple-darwin.tar.gz
-pasteforward-v0.1.1-x86_64-apple-darwin.tar.gz
-pasteforward-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
-pasteforward-v0.1.1-aarch64-unknown-linux-gnu.tar.gz
-pasteforward-v0.1.1-aarch64-apple-darwin.tar.gz.sha256
-pasteforward-v0.1.1-x86_64-apple-darwin.tar.gz.sha256
-pasteforward-v0.1.1-x86_64-unknown-linux-gnu.tar.gz.sha256
-pasteforward-v0.1.1-aarch64-unknown-linux-gnu.tar.gz.sha256
+pasteforward-v0.1.2-aarch64-apple-darwin.tar.gz
+pasteforward-v0.1.2-x86_64-apple-darwin.tar.gz
+pasteforward-v0.1.2-x86_64-unknown-linux-gnu.tar.gz
+pasteforward-v0.1.2-aarch64-unknown-linux-gnu.tar.gz
+pasteforward-v0.1.2-aarch64-apple-darwin.tar.gz.sha256
+pasteforward-v0.1.2-x86_64-apple-darwin.tar.gz.sha256
+pasteforward-v0.1.2-x86_64-unknown-linux-gnu.tar.gz.sha256
+pasteforward-v0.1.2-aarch64-unknown-linux-gnu.tar.gz.sha256
 ```

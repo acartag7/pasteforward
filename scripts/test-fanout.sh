@@ -4,7 +4,7 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 REAL_HOME="${HOME:?}"
 VM_NAME="${PASTEFORWARD_LIMA_VM:-pasteforward-linux}"
-MAC_HOST="${PASTEFORWARD_MAC_HOST:-acartagena@arnolds-mac-mini.tail46d819.ts.net}"
+MAC_HOST="${PASTEFORWARD_MAC_HOST:-}"
 BIN="${PASTEFORWARD_BIN:-$ROOT/target/release/pasteforward}"
 DISPLAY_NAME="${PASTEFORWARD_LIMA_DISPLAY:-:99}"
 DISPLAY_NUM="${DISPLAY_NAME#:}"
@@ -91,9 +91,13 @@ fi
 local_sha="$(shasum -a 256 "$png" | awk '{ print $1 }')"
 
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
-  "$BIN" init macfanout --host "$MAC_HOST" --remote-mode macos-pasteboard --no-install-service
+  "$BIN" init limaone --host "lima-$VM_NAME" --remote-mode linux-x11 --remote-env "DISPLAY=$DISPLAY_NAME" --no-install-service
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
-  "$BIN" init limafanout --host "lima-$VM_NAME" --remote-mode linux-x11 --remote-env "DISPLAY=$DISPLAY_NAME" --no-install-service
+  "$BIN" init limatwo --host "lima-$VM_NAME" --remote-mode linux-x11 --remote-env "DISPLAY=$DISPLAY_NAME" --no-install-service
+if [ -n "$MAC_HOST" ]; then
+  PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
+    "$BIN" init macfanout --host "$MAC_HOST" --remote-mode macos-pasteboard --no-install-service
+fi
 
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
   "$BIN" daemon >"$tmp/daemon.out" 2>"$tmp/daemon.err" &
@@ -102,38 +106,57 @@ sleep 1
 
 osascript -e "set the clipboard to (read POSIX file \"$png\" as «class PNGf»)"
 
+lima_one_line=""
+lima_two_line=""
 mac_line=""
-lima_line=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   history="$(PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" "$BIN" history || true)"
-  mac_line="$(printf '%s\n' "$history" | awk '$2 == "macfanout" { line=$0 } END { print line }')"
-  lima_line="$(printf '%s\n' "$history" | awk '$2 == "limafanout" { line=$0 } END { print line }')"
-  [ -n "$mac_line" ] && [ -n "$lima_line" ] && break
+  lima_one_line="$(printf '%s\n' "$history" | awk '$2 == "limaone" { line=$0 } END { print line }')"
+  lima_two_line="$(printf '%s\n' "$history" | awk '$2 == "limatwo" { line=$0 } END { print line }')"
+  if [ -n "$MAC_HOST" ]; then
+    mac_line="$(printf '%s\n' "$history" | awk '$2 == "macfanout" { line=$0 } END { print line }')"
+  fi
+  if [ -n "$lima_one_line" ] && [ -n "$lima_two_line" ] && { [ -z "$MAC_HOST" ] || [ -n "$mac_line" ]; }; then
+    break
+  fi
   sleep 1
 done
-if [ -z "$mac_line" ] || [ -z "$lima_line" ]; then
+if [ -z "$lima_one_line" ] || [ -z "$lima_two_line" ] || { [ -n "$MAC_HOST" ] && [ -z "$mac_line" ]; }; then
   echo "missing fan-out history" >&2
   cat "$tmp/daemon.err" >&2 || true
   exit 1
 fi
 
-mac_path="$(printf '%s\n' "$mac_line" | awk '{ print $6 }')"
-lima_path="$(printf '%s\n' "$lima_line" | awk '{ print $6 }')"
-mac_file_sha="$(PATH="$test_bin:$PATH" ssh "$MAC_HOST" "shasum -a 256 '$mac_path'" | awk '{ print $1 }')"
-lima_file_sha="$(PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "sha256sum '$lima_path'" | awk '{ print $1 }')"
+lima_one_path="$(printf '%s\n' "$lima_one_line" | awk '{ print $6 }')"
+lima_two_path="$(printf '%s\n' "$lima_two_line" | awk '{ print $6 }')"
+lima_one_file_sha="$(PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "sha256sum '$lima_one_path'" | awk '{ print $1 }')"
+lima_two_file_sha="$(PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "sha256sum '$lima_two_path'" | awk '{ print $1 }')"
 lima_clip_sha="$(PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "DISPLAY='$DISPLAY_NAME' timeout 5 xclip -selection clipboard -t image/png -o 2>/dev/null | sha256sum" | awk '{ print $1 }')"
-mac_clip_sha="$(PATH="$test_bin:$PATH" ssh "$MAC_HOST" "tmp=\"/tmp/pasteforward-clip-\$\$.png\"; /usr/bin/osascript -e 'set png_data to (the clipboard as «class PNGf»)' -e \"set fp to open for access POSIX file \\\"\$tmp\\\" with write permission\" -e 'set eof fp to 0' -e 'write png_data to fp' -e 'close access fp' >/dev/null && shasum -a 256 \"\$tmp\"; rm -f \"\$tmp\"" | awk '{ print $1 }')"
+if [ -n "$MAC_HOST" ]; then
+  mac_path="$(printf '%s\n' "$mac_line" | awk '{ print $6 }')"
+  mac_file_sha="$(PATH="$test_bin:$PATH" ssh "$MAC_HOST" "shasum -a 256 '$mac_path'" | awk '{ print $1 }')"
+  mac_clip_sha="$(PATH="$test_bin:$PATH" ssh "$MAC_HOST" "tmp=\"/tmp/pasteforward-clip-\$\$.png\"; /usr/bin/osascript -e 'set png_data to (the clipboard as «class PNGf»)' -e \"set fp to open for access POSIX file \\\"\$tmp\\\" with write permission\" -e 'set eof fp to 0' -e 'write png_data to fp' -e 'close access fp' >/dev/null && shasum -a 256 \"\$tmp\"; rm -f \"\$tmp\"" | awk '{ print $1 }')"
+fi
 
 printf 'local_sha=%s\n' "$local_sha"
-printf 'mac_path=%s\n' "$mac_path"
-printf 'lima_path=%s\n' "$lima_path"
-printf 'mac_file_sha=%s\n' "$mac_file_sha"
-printf 'lima_file_sha=%s\n' "$lima_file_sha"
-printf 'mac_clip_sha=%s\n' "$mac_clip_sha"
+printf 'lima_one_path=%s\n' "$lima_one_path"
+printf 'lima_two_path=%s\n' "$lima_two_path"
+if [ -n "$MAC_HOST" ]; then
+  printf 'mac_path=%s\n' "$mac_path"
+fi
+printf 'lima_one_file_sha=%s\n' "$lima_one_file_sha"
+printf 'lima_two_file_sha=%s\n' "$lima_two_file_sha"
 printf 'lima_clip_sha=%s\n' "$lima_clip_sha"
+if [ -n "$MAC_HOST" ]; then
+  printf 'mac_file_sha=%s\n' "$mac_file_sha"
+  printf 'mac_clip_sha=%s\n' "$mac_clip_sha"
+fi
 cat "$tmp/daemon.err"
 
-test "$mac_file_sha" = "$local_sha"
-test "$lima_file_sha" = "$local_sha"
-test "$mac_clip_sha" = "$local_sha"
+test "$lima_one_file_sha" = "$local_sha"
+test "$lima_two_file_sha" = "$local_sha"
 test "$lima_clip_sha" = "$local_sha"
+if [ -n "$MAC_HOST" ]; then
+  test "$mac_file_sha" = "$local_sha"
+  test "$mac_clip_sha" = "$local_sha"
+fi

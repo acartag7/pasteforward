@@ -35,7 +35,7 @@ Shape:
   },
   "destinations": {
     "macmini": {
-      "host": "acartagena@arnolds-mac-mini.tail46d819.ts.net",
+      "host": "user@mac.example",
       "enabled": true,
       "remote_mode": "auto"
     }

@@ -511,7 +511,7 @@ const BridgeScene = ({frame}: {frame: number}) => {
       >
         <Destination
           name="macmini"
-          host="acartagena@arnolds-mac-mini"
+          host="user@mac.example"
           mode="macos"
           active={progress > 0.84}
           delay={224}

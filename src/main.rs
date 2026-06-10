@@ -170,7 +170,6 @@ fn cmd_init(args: Vec<String>) -> Result<()> {
         install_service()?;
         println!("service installed and running");
     } else {
-        restart_service_if_installed()?;
         println!("service install skipped");
     }
 

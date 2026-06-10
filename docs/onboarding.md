@@ -6,7 +6,7 @@ receive local image clipboard updates.
 ## Add A macOS Destination
 
 ```sh
-pasteforward init macmini --host acartagena@arnolds-mac-mini.tail46d819.ts.net
+pasteforward init macmini --host user@mac.example
 ```
 
 Expected flow:
@@ -55,7 +55,7 @@ pasteforward list
 After `init`, keep using SSH normally:
 
 ```sh
-ssh acartagena@arnolds-mac-mini.tail46d819.ts.net
+ssh user@mac.example
 claude
 # or: codex
 ```
@@ -67,7 +67,7 @@ using its normal paste flow.
 For non-interactive setup, make service installation explicit:
 
 ```sh
-pasteforward init macmini --host acartagena@arnolds-mac-mini.tail46d819.ts.net --yes
+pasteforward init macmini --host user@mac.example --yes
 ```
 
 ## Remove A Destination

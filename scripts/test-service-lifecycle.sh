@@ -5,6 +5,7 @@ BIN="${PASTEFORWARD_BIN:-$HOME/.local/bin/pasteforward}"
 TEST_HOST="${PASTEFORWARD_SERVICE_TEST_HOST:?set PASTEFORWARD_SERVICE_TEST_HOST to an SSH host to run this test}"
 RESTORE_DEST="${PASTEFORWARD_SERVICE_RESTORE_DEST:-macmini}"
 RESTORE_HOST="${PASTEFORWARD_SERVICE_RESTORE_HOST:-$TEST_HOST}"
+RESTORE_BIN="${PASTEFORWARD_SERVICE_RESTORE_BIN:-}"
 CONFIG_PATH="${PASTEFORWARD_SERVICE_CONFIG_PATH:-$HOME/.config/pasteforward/config.json}"
 CONFIG_DIR="$(dirname "$CONFIG_PATH")"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/io.github.acartag7.pasteforward.plist"
@@ -32,7 +33,9 @@ status_has() {
 
 if status_has '^service: installed$'; then
   service_was_installed=1
-  if [ -f "$LAUNCHD_PLIST" ]; then
+  if [ -n "$RESTORE_BIN" ]; then
+    restore_bin="$RESTORE_BIN"
+  elif [ -f "$LAUNCHD_PLIST" ]; then
     detected_bin="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$LAUNCHD_PLIST" 2>/dev/null || true)"
     if [ -n "$detected_bin" ] && [ -x "$detected_bin" ]; then
       restore_bin="$detected_bin"

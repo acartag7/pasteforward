@@ -48,7 +48,7 @@ make install
 Add a destination and install the background service:
 
 ```sh
-pasteforward init macmini --host acartagena@arnolds-mac-mini.tail46d819.ts.net
+pasteforward init macmini --host user@mac.example
 ```
 
 `init` writes config, runs doctor checks, then asks whether to install or restart
@@ -58,7 +58,7 @@ Then use your normal SSH session. PasteForward keeps forwarding images in the
 background:
 
 ```sh
-ssh acartagena@arnolds-mac-mini.tail46d819.ts.net
+ssh user@mac.example
 claude
 ```
 
@@ -87,7 +87,7 @@ pasteforward --version
 Non-interactive service setup requires an explicit flag:
 
 ```sh
-pasteforward init macmini --host acartagena@arnolds-mac-mini.tail46d819.ts.net --yes
+pasteforward init macmini --host user@mac.example --yes
 ```
 
 ## Linux GUI Notes
@@ -128,13 +128,19 @@ Additional release smoke checks:
 scripts/test-ttl-cleanup.sh
 scripts/test-fanout.sh
 scripts/test-release-tarball.sh
-PASTEFORWARD_SERVICE_TEST_HOST=user@host scripts/test-service-lifecycle.sh
+PASTEFORWARD_SERVICE_TEST_HOST=user@host \
+  PASTEFORWARD_SERVICE_RESTORE_BIN="$HOME/.local/bin/pasteforward" \
+  scripts/test-service-lifecycle.sh
 ```
+
+`scripts/test-fanout.sh` uses Lima destinations by default. To include a real
+macOS SSH destination in the same fan-out run, set
+`PASTEFORWARD_MAC_HOST=user@mac.example`.
 
 Before release, also run the real terminal-agent path over a normal SSH session:
 
 ```sh
-ssh acartagena@arnolds-mac-mini.tail46d819.ts.net
+ssh user@mac.example
 claude
 codex
 ```

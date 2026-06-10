@@ -8,7 +8,7 @@ After a destination exists and the local service is installed, use the same SSH
 flow you already use:
 
 ```sh
-ssh acartagena@arnolds-mac-mini.tail46d819.ts.net
+ssh user@mac.example
 claude
 # or: codex
 ```
@@ -23,14 +23,14 @@ Use explicit service consent in non-interactive sessions:
 
 ```sh
 pasteforward init macmini \
-  --host acartagena@arnolds-mac-mini.tail46d819.ts.net \
+  --host user@mac.example \
   --yes
 ```
 
 Then run your normal SSH session:
 
 ```sh
-ssh acartagena@arnolds-mac-mini.tail46d819.ts.net
+ssh user@mac.example
 claude
 ```
 
@@ -43,7 +43,7 @@ destination.
 Add another destination:
 
 ```sh
-pasteforward init linuxvm --host user@linuxvm --yes
+pasteforward init linuxvm --host user@linuxvm.example --yes
 ```
 
 Check what the daemon will use:
