@@ -1,4 +1,6 @@
 /target/
 /dist/
+/media/remotion/node_modules/
+/media/remotion/out/
 /.DS_Store
 *.log

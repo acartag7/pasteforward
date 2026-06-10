@@ -1,8 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
-if grep -RInE 'curl .*\| *(sh|bash)|wget .*\| *(sh|bash)' . \
-  --exclude=check-supply-chain.sh --exclude-dir=.git --exclude-dir=target; then
+if git ls-files --cached --others --exclude-standard -z \
+  | xargs -0 grep -IInE 'curl .*\| *(sh|bash)|wget .*\| *(sh|bash)' 2>/dev/null \
+  | grep -v '^scripts/check-supply-chain.sh:'; then
   echo "pipe-to-shell pattern found" >&2
   exit 1
 fi

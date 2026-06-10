@@ -6,6 +6,10 @@ It runs locally, watches your image clipboard, and forwards each new image to
 the clipboard of every configured SSH destination. The terminal agent on the
 remote machine keeps using its normal paste path.
 
+## Demo
+
+![PasteForward image paste over SSH demo](docs/assets/pasteforward-demo.gif)
+
 ## Scope
 
 V0 supports:
@@ -26,6 +30,14 @@ path-injection transport, not clipboard mirroring.
 ## Install From Source
 
 Requires Rust 1.85+.
+
+Install with Cargo to `~/.cargo/bin`:
+
+```sh
+cargo install --path . --locked --force
+```
+
+Or install to `~/.local/bin`:
 
 ```sh
 make install

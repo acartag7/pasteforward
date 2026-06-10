@@ -34,6 +34,10 @@ mkdir -p "$STAGE/docs"
 cp target/release/pasteforward "$STAGE/pasteforward"
 cp README.md LICENSE "$STAGE/"
 cp docs/*.md "$STAGE/docs/"
+if [ -d docs/assets ]; then
+  mkdir -p "$STAGE/docs/assets"
+  cp docs/assets/* "$STAGE/docs/assets/"
+fi
 
 mkdir -p "$DIST"
 tar -C "$DIST" -czf "$DIST/$NAME.tar.gz" "$NAME"

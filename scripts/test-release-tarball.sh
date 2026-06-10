@@ -19,6 +19,8 @@ test -x "$bin"
 test -f "$dir/README.md"
 test -f "$dir/LICENSE"
 test -f "$dir/docs/security.md"
+test -f "$dir/docs/assets/pasteforward-demo.gif"
+test ! -d "$dir/media"
 
 "$bin" --version
 "$bin" help >/dev/null
