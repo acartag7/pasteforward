@@ -201,7 +201,7 @@ pub(crate) fn remote_clipboard_probe_command(
             " && test -r \"${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}\"",
             " && test -w \"${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}\"",
             " && probe_status=0 && probe_output=\"$(timeout 2 wl-paste --list-types 2>&1 >/dev/null)\" || probe_status=$?",
-            " && if test \"$probe_status\" -ne 0; then case \"$probe_output\" in *\"No selection\"*) true ;; *) false ;; esac; fi"
+            " && if test \"$probe_status\" -ne 0; then case \"$probe_output\" in \"No selection\"|\"Nothing is copied\") true ;; *) false ;; esac; fi"
         )
         .to_string(),
         RemoteMode::LinuxX11 => concat!(
@@ -261,6 +261,13 @@ mod tests {
         let mac = read_clipboard_command(&dest(), &RemoteMode::MacosPasteboard).unwrap();
         assert!(mac.contains("public.png"));
         assert!(mac.contains("fileHandleWithStandardOutput"));
+    }
+
+    #[test]
+    fn wayland_probe_allows_only_known_empty_clipboard_results() {
+        let command = remote_clipboard_probe_command(&dest(), &RemoteMode::LinuxWayland).unwrap();
+        assert!(command.contains("\"No selection\"|\"Nothing is copied\""));
+        assert!(command.contains("*) false"));
     }
 
     #[test]

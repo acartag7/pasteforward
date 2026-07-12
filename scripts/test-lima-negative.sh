@@ -72,11 +72,11 @@ cat >"$tmp/xclip" <<'EOF'
 exit 7
 EOF
 PATH="$test_bin:$PATH" scp -F "$REAL_HOME/.lima/$X11_VM/ssh.config" "$tmp/xclip" "lima-$X11_VM:/tmp/pf-failing-xclip" >/dev/null
-PATH="$test_bin:$PATH" ssh "lima-$X11_VM" 'sudo install -m 0755 /tmp/pf-failing-xclip /usr/local/bin/xclip'
 config="$tmp/backend-config"
 state="$tmp/backend-state"
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config" PASTEFORWARD_STATE_HOME="$state" \
   "$BIN" init backend --host "lima-$X11_VM" --remote-mode linux-x11 --remote-env DISPLAY=:99 --no-install-service >/dev/null
+PATH="$test_bin:$PATH" ssh "lima-$X11_VM" 'sudo install -m 0755 /tmp/pf-failing-xclip /usr/local/bin/xclip'
 expect_failure env PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config" PASTEFORWARD_STATE_HOME="$state" \
   "$BIN" test backend
 test ! -e "$state/history.jsonl"

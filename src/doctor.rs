@@ -85,12 +85,7 @@ pub fn doctor_destination(
     }
 
     let remote_dir = config.destination_remote_dir(dest);
-    let parent = remote_dir_parent(&remote_dir);
-    let dir_cmd = format!(
-        "if test -d {dir}; then test -w {dir}; else test -d {parent} && test -w {parent}; fi",
-        dir = shell_quote(&remote_dir),
-        parent = shell_quote(parent)
-    );
+    let dir_cmd = remote_dir_probe_command(&remote_dir);
     match ssh(&dest.host, &dir_cmd, None) {
         Ok(_) => result.remote_dir_ok = true,
         Err(err) => result.problems.push(format!("remote dir failed: {err}")),
@@ -113,14 +108,17 @@ pub fn prepare_remote_directory(config: &AppConfig, dest: &DestinationConfig) ->
     Ok(())
 }
 
-fn remote_dir_parent(remote_dir: &str) -> &str {
-    remote_dir
-        .trim_end_matches('/')
-        .rsplit_once('/')
-        .map_or(
-            "/",
-            |(parent, _)| if parent.is_empty() { "/" } else { parent },
-        )
+fn remote_dir_probe_command(remote_dir: &str) -> String {
+    format!(
+        concat!(
+            "probe={}; ",
+            "while ! test -e \"$probe\"; do ",
+            "parent=\"${{probe%/*}}\"; ",
+            "if test -z \"$parent\"; then probe=/; else probe=\"$parent\"; fi; ",
+            "done; test -d \"$probe\" && test -w \"$probe\""
+        ),
+        shell_quote(remote_dir)
+    )
 }
 
 pub fn local_doctor_problem() -> Option<String> {
@@ -140,8 +138,23 @@ mod tests {
 
     #[test]
     fn remote_directory_probe_is_read_only() {
-        assert_eq!(remote_dir_parent("/tmp/pasteforward"), "/tmp");
-        assert_eq!(remote_dir_parent("/cache"), "/");
+        let root = std::env::temp_dir().join(format!(
+            "pasteforward-doctor-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let nested = root.join("missing").join("nested");
+        let command = remote_dir_probe_command(&nested.to_string_lossy());
+        assert!(
+            std::process::Command::new("sh")
+                .args(["-c", &command])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(!nested.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
