@@ -146,7 +146,9 @@ Wayland sessions may need `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.
 make verify
 ```
 
-This runs formatting checks, tests, build, and supply-chain checks.
+This runs formatting checks, tests, build, and supply-chain checks. The
+verification-only workflow pin check requires Ruby with its standard YAML
+library; Ruby is not a runtime dependency of PasteForward.
 
 On macOS with Lima installed, run the Linux integration tests:
 

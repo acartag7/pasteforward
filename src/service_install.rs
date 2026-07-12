@@ -199,8 +199,15 @@ fn rollback_systemd_install(
         None => {
             let cleanup = invoke_systemctl(&["disable", "--now", unit_name]);
             return rollback_service_file(unit, previous, original, || {
-                cleanup?;
-                invoke_systemctl(&["daemon-reload"])
+                let reload = invoke_systemctl(&["daemon-reload"]);
+                match (cleanup, reload) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(cleanup), Ok(())) => Err(cleanup),
+                    (Ok(()), Err(reload)) => Err(reload),
+                    (Err(cleanup), Err(reload)) => Err(Error::DoctorFailed(format!(
+                        "new service cleanup failed ({cleanup}) and systemd daemon reload failed ({reload})"
+                    ))),
+                }
             });
         }
     };
@@ -429,9 +436,13 @@ mod tests {
                 assert!(
                     matches!(result, Err(Error::DoctorFailed(message)) if message.contains("service state could not be restored"))
                 );
+                let expected_trace = if state.is_none() && fail_at == 0 {
+                    expected.as_slice()
+                } else {
+                    &expected[..=fail_at]
+                };
                 assert_eq!(
-                    trace,
-                    expected[..=fail_at],
+                    trace, expected_trace,
                     "state case {label}, failure {fail_at}"
                 );
                 if previous.is_some() {
@@ -442,6 +453,42 @@ mod tests {
                 fs::remove_dir_all(root).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn new_systemd_rollback_reports_cleanup_and_reload_failures() {
+        let root = test_dir("new-double-failure");
+        create_owner_only_dir(&root).unwrap();
+        let path = root.join("service");
+        write_owner_only_atomic(&path, b"candidate").unwrap();
+        let mut trace = Vec::new();
+        let result = rollback_systemd_install(
+            &path,
+            None,
+            Error::DoctorFailed("activate failed".to_string()),
+            "pasteforward.service",
+            None,
+            |args| {
+                trace.push(
+                    args.iter()
+                        .map(|arg| (*arg).to_string())
+                        .collect::<Vec<_>>(),
+                );
+                Err(Error::DoctorFailed("injected failure".to_string()))
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("new service cleanup failed") && message.contains("daemon reload failed"))
+        );
+        assert_eq!(
+            trace,
+            vec![
+                vec!["disable", "--now", "pasteforward.service"],
+                vec!["daemon-reload"]
+            ]
+        );
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn systemd_restore_cases() -> Vec<SystemdRestoreCase> {

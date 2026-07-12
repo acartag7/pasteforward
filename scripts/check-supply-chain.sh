@@ -8,39 +8,7 @@ if git ls-files --cached --others --exclude-standard -z \
   exit 1
 fi
 
-action_targets() {
-  sed -nE \
-    -e '/^[[:space:]]*#/d' \
-    -e 's/^[[:space:]]*(-[[:space:]]+)?uses[[:space:]]*:[[:space:]]*([^#[:space:]]+).*$/\2/p'
-}
-
-action_target_is_pinned() {
-  target=$1
-  case "$target" in
-    ./*) return 0 ;;
-    *@*) ref=${target##*@} ;;
-    *) return 1 ;;
-  esac
-  [ "${#ref}" -eq 40 ] && ! printf '%s' "$ref" | grep -q '[^0-9a-f]'
-}
-
-test "$(printf '%s\n' '  - uses: owner/action@v4 # uses: decoy/action@0123456789abcdef0123456789abcdef01234567' | action_targets)" = "owner/action@v4"
-test -z "$(printf '%s\n' '  # - uses: owner/action@v4' | action_targets)"
-test "$(printf '%s\n' '    uses: owner/repo/.github/workflows/check.yml@0123456789abcdef0123456789abcdef01234567 # reusable' | action_targets)" = "owner/repo/.github/workflows/check.yml@0123456789abcdef0123456789abcdef01234567"
-if action_target_is_pinned 'owner/action@v4'; then
-  echo "action pinning self-test failed" >&2
-  exit 1
-fi
-action_target_is_pinned 'owner/action@0123456789abcdef0123456789abcdef01234567'
-
-grep -RhE 'uses[[:space:]]*:[[:space:]]+' .github/workflows 2>/dev/null \
-  | action_targets \
-  | while IFS= read -r target; do
-      if ! action_target_is_pinned "$target"; then
-        echo "unpinned GitHub Action found: $target" >&2
-        exit 1
-      fi
-    done
+ruby scripts/check-workflow-pins.rb
 
 test -f Cargo.lock
 grep -q '^channel = "1.85.1"$' rust-toolchain.toml
