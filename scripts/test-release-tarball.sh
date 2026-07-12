@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT"
 
 artifact_path="$(scripts/package-release.sh | sed -n 's#^\(.*/pasteforward-v.*\.tar\.gz\)$#\1#p' | tail -n 1)"
@@ -14,6 +14,7 @@ tmp="$(mktemp -d)"
 tar -C "$tmp" -xzf "$artifact_path"
 dir="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 bin="$dir/pasteforward"
+mkdir -p "$tmp/home"
 
 test -x "$bin"
 test -f "$dir/README.md"
@@ -24,8 +25,8 @@ test ! -d "$dir/media"
 
 "$bin" --version
 "$bin" help >/dev/null
-PASTEFORWARD_CONFIG_HOME="$tmp/config" PASTEFORWARD_STATE_HOME="$tmp/state" "$bin" status
-PASTEFORWARD_CONFIG_HOME="$tmp/config" PASTEFORWARD_STATE_HOME="$tmp/state" "$bin" doctor
+HOME="$tmp/home" PASTEFORWARD_CONFIG_HOME="$tmp/config" PASTEFORWARD_STATE_HOME="$tmp/state" "$bin" status
+HOME="$tmp/home" PASTEFORWARD_CONFIG_HOME="$tmp/config" PASTEFORWARD_STATE_HOME="$tmp/state" "$bin" doctor
 
 (
   cd "$(dirname "$artifact_path")"

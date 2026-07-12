@@ -26,6 +26,7 @@ jobs:
           set -euo pipefail
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           test "${GITHUB_REF_NAME}" = "v${version}"
+          test -f ".github/release-notes/${GITHUB_REF_NAME}.md"
 
   create-release:
     needs: validate
@@ -34,6 +35,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -41,12 +43,15 @@ jobs:
           set -euo pipefail
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             echo "Release ${GITHUB_REF_NAME} already exists"
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file ".github/release-notes/${GITHUB_REF_NAME}.md"
           else
             gh release create "${GITHUB_REF_NAME}" \
               --verify-tag \
               --draft \
               --title "${GITHUB_REF_NAME}" \
-              --generate-notes
+              --notes-file ".github/release-notes/${GITHUB_REF_NAME}.md"
           fi
 
   assets:
@@ -54,20 +59,42 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
-          - macos-15
-          - macos-15-intel
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            linux: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            linux: true
+          - os: macos-15
+            target: aarch64-apple-darwin
+            linux: false
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            linux: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: make verify
+      - name: Install Linux packaging tools
+        if: matrix.linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            musl-tools=1.2.4-2 \
+            rpm=4.18.2+dfsg-2.1build2 \
+            cpio=2.15+dfsg-1ubuntu2
+      - name: Install Rust release target
+        run: rustup target add "${{ matrix.target }}"
       - name: Package release tarball
         id: package
+        env:
+          PASTEFORWARD_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           artifact_path="$(scripts/package-release.sh | sed -n 's#^\(.*/pasteforward-v.*\.tar\.gz\)$#\1#p' | tail -n 1)"
@@ -75,29 +102,193 @@ jobs:
             echo "package script did not report a tarball path" >&2
             exit 1
           fi
-          checksum_path="${artifact_path}.sha256"
-          (
-            cd "$(dirname "${artifact_path}")"
-            if command -v shasum >/dev/null 2>&1; then
-              shasum -a 256 "$(basename "${artifact_path}")"
-            else
-              sha256sum "$(basename "${artifact_path}")"
-            fi
-          ) > "${checksum_path}"
-          echo "artifact_path=${artifact_path}" >> "${GITHUB_OUTPUT}"
-          echo "checksum_path=${checksum_path}" >> "${GITHUB_OUTPUT}"
+          if [ "${{ matrix.linux }}" = "true" ]; then
+            scripts/package-deb.sh
+            scripts/package-rpm.sh
+            PASTEFORWARD_EXPECT_PACKAGES=1 scripts/test-package-contents.sh
+            deb="$(find dist -maxdepth 1 -name 'pasteforward_*.deb' -print -quit)"
+            sudo apt-get install -y "./${deb}"
+            /usr/bin/pasteforward --version
+            test ! -e "$HOME/.config/pasteforward/config.json"
+            test ! -e "$HOME/.config/systemd/user/pasteforward.service"
+            sudo apt-get remove -y pasteforward
+            test ! -e /usr/bin/pasteforward
+
+            rpm="$(find "$PWD/dist" -maxdepth 1 -name 'pasteforward-*.rpm' -print -quit)"
+            docker run --rm \
+              -v "${rpm}:/tmp/pasteforward.rpm:ro" \
+              registry.fedoraproject.org/fedora:42@sha256:e78cd1a688cd079c23864f289a89a49a3f4ad66d817864e325e1d058310ee95c \
+              sh -eu -c 'dnf install -y /tmp/pasteforward.rpm >/dev/null; pasteforward --version; test ! -e "$HOME/.config/pasteforward/config.json"; test ! -e "$HOME/.config/systemd/user/pasteforward.service"; dnf remove -y pasteforward >/dev/null; ! command -v pasteforward'
+          fi
+          for artifact in dist/pasteforward-* dist/pasteforward_*; do
+            test -e "${artifact}" || continue
+            case "${artifact}" in *.sha256) continue ;; esac
+            artifact_dir="$(dirname "${artifact}")"
+            artifact_name="$(basename "${artifact}")"
+            (
+              cd "${artifact_dir}"
+              if command -v shasum >/dev/null 2>&1; then
+                shasum -a 256 "${artifact_name}"
+              else
+                sha256sum "${artifact_name}"
+              fi
+            ) > "${artifact}.sha256"
+          done
+      - name: Attest release artifacts
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4, 2026-06-26
+        with:
+          subject-path: dist/pasteforward-*
+      - name: Attest Debian artifacts
+        if: matrix.linux
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4, 2026-06-26
+        with:
+          subject-path: dist/pasteforward_*
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release upload "${GITHUB_REF_NAME}" \
-            "${{ steps.package.outputs.artifact_path }}" \
-            "${{ steps.package.outputs.checksum_path }}" \
-            --clobber
+          files=(dist/pasteforward-*)
+          if [ "${{ matrix.linux }}" = "true" ]; then
+            files+=(dist/pasteforward_*)
+          fi
+          gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
+      - name: Consume exact uploaded assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir downloaded
+          gh release download "${GITHUB_REF_NAME}" \
+            --pattern "*${{ matrix.target }}*" \
+            --dir downloaded
+          if [ "${{ matrix.linux }}" = "true" ]; then
+            case "${{ matrix.target }}" in
+              aarch64-*) package_arch=arm64; rpm_arch=aarch64 ;;
+              x86_64-*) package_arch=amd64; rpm_arch=x86_64 ;;
+            esac
+            gh release download "${GITHUB_REF_NAME}" \
+              --pattern "pasteforward_*_${package_arch}.deb*" \
+              --pattern "pasteforward-*-1.${rpm_arch}.rpm*" \
+              --dir downloaded
+          fi
+          (
+            cd downloaded
+            for checksum in *.sha256; do
+              if command -v shasum >/dev/null 2>&1; then
+                shasum -a 256 -c "${checksum}"
+              else
+                sha256sum -c "${checksum}"
+              fi
+            done
+            tarball="$(find . -maxdepth 1 -name '*${{ matrix.target }}.tar.gz' -print -quit)"
+            tar -xzf "${tarball}"
+            extracted="${tarball#./}"
+            "${extracted%.tar.gz}/pasteforward" --version
+          )
+          gh attestation verify downloaded/* --repo "${GITHUB_REPOSITORY}"
+
+  formula:
+    needs: assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Download release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "${GITHUB_REF_NAME}" --pattern '*.tar.gz.sha256' --dir dist
+      - name: Render and upload Homebrew formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          formula="$(scripts/render-homebrew-formula.sh)"
+          (
+            cd "$(dirname "${formula}")"
+            sha256sum "$(basename "${formula}")"
+          ) > "${formula}.sha256"
+          gh release upload "${GITHUB_REF_NAME}" "${formula}" "${formula}.sha256" --clobber
+      - name: Attest Homebrew formula
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4, 2026-06-26
+        with:
+          subject-path: |
+            dist/pasteforward.rb
+            dist/pasteforward.rb.sha256
+      - name: Consume exact uploaded formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir formula-download
+          gh release download "${GITHUB_REF_NAME}" --pattern 'pasteforward.rb*' --dir formula-download
+          (
+            cd formula-download
+            sha256sum -c pasteforward.rb.sha256
+          )
+          cmp dist/pasteforward.rb formula-download/pasteforward.rb
+
+  formula-test:
+    needs: formula
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Download formula and exact macOS artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "${GITHUB_REF_NAME}" \
+            --pattern 'pasteforward.rb' \
+            --pattern '*${{ matrix.target }}.tar.gz' \
+            --dir dist
+      - name: Install and test formula against downloaded artifact
+        run: |
+          set -euo pipefail
+          tarball="$(find "$PWD/dist" -maxdepth 1 -name '*${{ matrix.target }}.tar.gz' -print -quit)"
+          formula="$PWD/dist/pasteforward.rb"
+          escaped="$(printf '%s' "file://${tarball}" | sed 's/[&|]/\\&/g')"
+          sed -i.bak -E "s|https://github.com/.*/pasteforward-v[^\"]*-${{ matrix.target }}\.tar\.gz|${escaped}|" "${formula}"
+          rm -f "${formula}.bak"
+          tap="pasteforward/release-test"
+          brew tap-new "${tap}"
+          tap_dir="$(brew --repository "${tap}")"
+          cp "${formula}" "${tap_dir}/Formula/pasteforward.rb"
+          brew audit --strict --formula "${tap}/pasteforward"
+          brew install "${tap}/pasteforward"
+          brew test "${tap}/pasteforward"
+          pasteforward --version
+          brew uninstall pasteforward
+          brew untap "${tap}"
+
+  owner-acceptance:
+    needs: formula-test
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: Require owner-run acceptance for this exact commit
+        env:
+          ACCEPTED_SHA: ${{ vars.PASTEFORWARD_RELEASE_ACCEPTED_SHA }}
+        run: |
+          test -n "${ACCEPTED_SHA}"
+          test "${ACCEPTED_SHA}" = "${GITHUB_SHA}"
 
   publish:
-    needs: assets
+    needs: owner-acceptance
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -107,3 +298,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "${GITHUB_REF_NAME}" --draft=false --verify-tag
+
+  tap-pr:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Download public verified formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "${GITHUB_REF_NAME}" --pattern 'pasteforward.rb' --dir dist
+      - name: Open Homebrew tap update PR
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: scripts/open-homebrew-tap-pr.sh "${GITHUB_REF_NAME}" dist/pasteforward.rb

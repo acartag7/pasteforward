@@ -45,6 +45,51 @@ Shape:
 
 Destination names may contain only ASCII letters, digits, `-`, and `_`.
 
+SSH hosts must be non-empty, must not begin with `-`, and must not contain
+ASCII control characters. PasteForward passes the host to `ssh` as one
+destination argument and does not accept embedded SSH options.
+
+Remote environment overrides are limited to:
+
+- `DISPLAY`
+- `WAYLAND_DISPLAY`
+- `XDG_RUNTIME_DIR`
+
+Unknown keys, blank values, malformed config, and unsupported config versions
+reject the entire config before any local or remote side effect.
+
+Remote cache directories use one canonical lexical form: exactly one leading
+`/`, one or more non-empty path segments, no trailing or repeated `/`, and no
+`.` or `..` segment. Root spellings such as `/`, `//`, and `///` are rejected.
+The same validation runs again at every exported execution boundary.
+
+## Initialization Contract
+
+`pasteforward init` without arguments starts an interactive setup wizard.
+`pasteforward init <dest> --host <ssh-host>` remains the non-interactive shape.
+
+Initialization builds and validates a candidate config in memory, then runs
+local and remote doctor checks. The config is committed only after all required
+checks pass. A failed check returns a non-zero exit status and does not write
+config, install a service, or create the remote cache directory.
+
+After checks pass, initialization creates the remote cache, commits config, and
+installs or restarts the user service only after explicit interactive consent,
+`--yes`, or `--install-service`.
+
+`doctor` is read-only. It returns non-zero when the local clipboard or any
+selected destination fails a required check.
+
+## End-To-End Test Contract
+
+`pasteforward test <dest>` reads the current local clipboard image, forwards it
+once to the selected destination, reads the destination clipboard image back,
+and compares SHA-256 hashes. It reports success only when they match.
+
+The test has fixed command timeouts and byte caps. It does not start the daemon,
+write transfer history, or retain image bytes locally. It intentionally replaces
+the selected remote clipboard and says so before running interactively.
+
 ## Remote Modes
 
 Supported remote modes:
@@ -54,7 +99,9 @@ Supported remote modes:
 - `linux-wayland`
 - `linux-x11`
 
-`auto` detects the remote OS and available clipboard tool over SSH.
+`auto` detects the remote OS, installed clipboard tools, and a reachable GUI
+session over SSH. Wayland is selected only when its socket is usable; otherwise
+PasteForward falls back to a reachable X11 socket.
 
 For `macos-pasteboard`, PasteForward writes the remote temp PNG to the
 pasteboard as `public.png`, adds `public.tiff` when AppKit can render it, and
@@ -67,13 +114,20 @@ The daemon:
 - reads config every poll loop
 - watches local image clipboard changes only
 - forwards a new image hash to all enabled destinations
-- records transfer metadata when history is enabled
+- reads the remote clipboard back and records transfer metadata only after the
+  bytes match the source SHA-256
 - periodically removes expired remote files from paths it previously wrote
 
 The daemon does not sync clipboard text.
 
 Only one daemon should run for a user. Startup refuses to replace a live daemon
 pid and overwrites stale pid files.
+
+Service definitions use a stable absolute executable path. Package upgrades
+must not leave launchd or systemd pointing at a removed versioned path.
+
+`install-service` and `uninstall-service` change only the local user service.
+They never add, delete, or purge destinations or history.
 
 ## History Contract
 

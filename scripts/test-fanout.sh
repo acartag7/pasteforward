@@ -1,7 +1,9 @@
 #!/usr/bin/env sh
+# Remote commands interpolate only fixture values and validated PasteForward-generated paths.
+# shellcheck disable=SC2029
 set -eu
 
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 REAL_HOME="${HOME:?}"
 VM_NAME="${PASTEFORWARD_LIMA_VM:-pasteforward-linux}"
 MAC_HOST="${PASTEFORWARD_MAC_HOST:-}"
@@ -99,22 +101,21 @@ if [ -n "$MAC_HOST" ]; then
     "$BIN" init macfanout --host "$MAC_HOST" --remote-mode macos-pasteboard --no-install-service
 fi
 
+osascript -e "set the clipboard to (read POSIX file \"$png\" as «class PNGf»)"
+
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
   "$BIN" daemon >"$tmp/daemon.out" 2>"$tmp/daemon.err" &
 daemon_pid=$!
-sleep 1
-
-osascript -e "set the clipboard to (read POSIX file \"$png\" as «class PNGf»)"
 
 lima_one_line=""
 lima_two_line=""
 mac_line=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   history="$(PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" "$BIN" history || true)"
-  lima_one_line="$(printf '%s\n' "$history" | awk '$2 == "limaone" { line=$0 } END { print line }')"
-  lima_two_line="$(printf '%s\n' "$history" | awk '$2 == "limatwo" { line=$0 } END { print line }')"
+  lima_one_line="$(printf '%s\n' "$history" | awk -v sha="$local_sha" '$2 == "limaone" && $5 == sha { line=$0 } END { print line }')"
+  lima_two_line="$(printf '%s\n' "$history" | awk -v sha="$local_sha" '$2 == "limatwo" && $5 == sha { line=$0 } END { print line }')"
   if [ -n "$MAC_HOST" ]; then
-    mac_line="$(printf '%s\n' "$history" | awk '$2 == "macfanout" { line=$0 } END { print line }')"
+    mac_line="$(printf '%s\n' "$history" | awk -v sha="$local_sha" '$2 == "macfanout" && $5 == sha { line=$0 } END { print line }')"
   fi
   if [ -n "$lima_one_line" ] && [ -n "$lima_two_line" ] && { [ -z "$MAC_HOST" ] || [ -n "$mac_line" ]; }; then
     break

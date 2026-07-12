@@ -3,6 +3,15 @@
 PasteForward is destination-oriented. A destination is one SSH target that should
 receive local image clipboard updates.
 
+## Guided Setup
+
+```sh
+pasteforward init
+```
+
+The wizard asks for a destination name and SSH destination, validates both local
+and remote clipboard access, then asks before installing the user service.
+
 ## Add A macOS Destination
 
 ```sh
@@ -11,12 +20,13 @@ pasteforward init macmini --host user@mac.example
 
 Expected flow:
 
-1. config is written to `~/.config/pasteforward/config.json`
+1. all input and the candidate config are validated in memory
 2. local clipboard backend is checked
 3. SSH connectivity is checked
-4. remote clipboard commands are checked
-5. remote cache dir is created under `/tmp/pasteforward`
-6. PasteForward asks to install/restart the local service
+4. remote clipboard commands and cache parent are checked read-only
+5. remote cache dir is prepared under `/tmp/pasteforward`
+6. config is written atomically to `~/.config/pasteforward/config.json`
+7. PasteForward asks to install/restart the local service
 
 ## Add A Linux GUI Destination
 
@@ -48,6 +58,13 @@ reports missing tools and leaves package installation to the operator.
 pasteforward doctor
 pasteforward status
 pasteforward list
+```
+
+Verify the current local clipboard image reaches a destination and can be read
+back byte-for-byte:
+
+```sh
+pasteforward test macmini
 ```
 
 ## Start Claude Or Codex

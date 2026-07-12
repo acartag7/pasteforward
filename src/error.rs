@@ -16,6 +16,11 @@ pub enum Error {
         code: Option<i32>,
         stderr: String,
     },
+    CommandTimedOut {
+        program: String,
+        seconds: u64,
+    },
+    LimitExceeded(String),
     DoctorFailed(String),
 }
 
@@ -33,28 +38,38 @@ impl Display for Error {
             Error::UnsupportedPlatform(message) => write!(f, "{message}"),
             Error::CommandFailed {
                 program,
-                args,
+                args: _,
                 code,
                 stderr,
             } => {
-                let rendered = std::iter::once(program.as_str())
-                    .chain(args.iter().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join(" ");
                 let status = code.map_or_else(|| "signal".to_string(), |c| c.to_string());
-                let detail = stderr.trim();
+                let detail = sanitize_command_detail(stderr);
                 if detail.is_empty() {
-                    write!(f, "command failed with status {status}: {rendered}")
+                    write!(f, "command failed with status {status}: {program}")
                 } else {
                     write!(
                         f,
-                        "command failed with status {status}: {rendered}: {detail}"
+                        "command failed with status {status}: {program}: {detail}"
                     )
                 }
             }
+            Error::CommandTimedOut { program, seconds } => {
+                write!(f, "command timed out after {seconds}s: {program}")
+            }
+            Error::LimitExceeded(message) => write!(f, "{message}"),
             Error::DoctorFailed(message) => write!(f, "{message}"),
         }
     }
+}
+
+fn sanitize_command_detail(value: &str) -> String {
+    let mut detail = value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(1024)
+        .collect::<String>();
+    detail.truncate(detail.trim_end().len());
+    detail
 }
 
 impl std::error::Error for Error {}
@@ -68,5 +83,17 @@ impl From<io::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Error::Json(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_details_are_single_line_and_bounded() {
+        let detail = sanitize_command_detail(&format!("first\n{}", "x".repeat(2000)));
+        assert!(!detail.contains('\n'));
+        assert_eq!(detail.len(), 1024);
     }
 }

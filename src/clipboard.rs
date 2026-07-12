@@ -1,5 +1,5 @@
-use crate::command::{run, run_ok};
-use crate::config::state_dir;
+use crate::command::{MAX_COMMAND_INPUT_BYTES, run, run_ok};
+use crate::config::{create_owner_only_dir, state_dir};
 use crate::error::{Error, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -39,14 +39,16 @@ pub fn detect_local_backend() -> Result<LocalClipboardBackend> {
     }
 
     if cfg!(target_os = "linux") {
-        if run_ok("wl-paste", &["--version".to_string()], None) {
+        if local_wayland_socket_reachable() && run_ok("wl-paste", &["--version".to_string()], None)
+        {
             return Ok(LocalClipboardBackend::LinuxWayland);
         }
-        if run_ok("xclip", &["-version".to_string()], None) {
+        if local_x11_socket_reachable() && run_ok("xclip", &["-version".to_string()], None) {
             return Ok(LocalClipboardBackend::LinuxX11);
         }
         return Err(Error::UnsupportedPlatform(
-            "Linux clipboard support requires wl-paste or xclip".to_string(),
+            "Linux clipboard support requires a reachable Wayland session with wl-paste or an X11 session with xclip"
+                .to_string(),
         ));
     }
 
@@ -55,12 +57,70 @@ pub fn detect_local_backend() -> Result<LocalClipboardBackend> {
     ))
 }
 
+fn local_wayland_socket_reachable() -> bool {
+    let (Some(runtime), Some(display)) = (
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("WAYLAND_DISPLAY"),
+    ) else {
+        return false;
+    };
+    let socket = std::path::PathBuf::from(runtime).join(display);
+    is_unix_socket(&socket)
+}
+
+fn local_x11_socket_reachable() -> bool {
+    let Some(display) = std::env::var_os("DISPLAY") else {
+        return false;
+    };
+    let Some(socket) = x11_socket_path(&display.to_string_lossy()) else {
+        return false;
+    };
+    is_unix_socket(&socket)
+}
+
+fn x11_socket_path(display: &str) -> Option<std::path::PathBuf> {
+    let value = display
+        .strip_prefix("unix:")
+        .or_else(|| display.strip_prefix(':'))?;
+    let number = value.split('.').next()?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(std::path::PathBuf::from(format!(
+        "/tmp/.X11-unix/X{number}"
+    )))
+}
+
+#[cfg(unix)]
+fn is_unix_socket(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    path.metadata().is_ok_and(|metadata| {
+        let mode = metadata.permissions().mode();
+        metadata.file_type().is_socket() && mode & 0o444 != 0 && mode & 0o222 != 0
+    })
+}
+
+#[cfg(not(unix))]
+fn is_unix_socket(_path: &std::path::Path) -> bool {
+    false
+}
+
 pub fn read_image(backend: &LocalClipboardBackend) -> Result<Option<ClipboardImage>> {
     let bytes = match backend {
         LocalClipboardBackend::MacosPasteboard => read_macos_image()?,
         LocalClipboardBackend::LinuxWayland => read_wayland_image()?,
         LocalClipboardBackend::LinuxX11 => read_x11_image()?,
     };
+
+    if bytes
+        .as_ref()
+        .is_some_and(|data| data.len() > MAX_COMMAND_INPUT_BYTES)
+    {
+        return Err(Error::LimitExceeded(format!(
+            "clipboard image exceeds {} byte limit",
+            MAX_COMMAND_INPUT_BYTES
+        )));
+    }
 
     Ok(bytes.map(|data| ClipboardImage {
         sha256: sha256_hex(&data),
@@ -77,8 +137,17 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 fn read_macos_image() -> Result<Option<Vec<u8>>> {
     let tmp_dir = state_dir()?.join("tmp");
-    fs::create_dir_all(&tmp_dir)?;
-    let path = tmp_dir.join(format!("clipboard-{}.png", std::process::id()));
+    create_owner_only_dir(&tmp_dir)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = tmp_dir.join(format!("clipboard-{}-{nonce}.png", std::process::id()));
+    let _file = fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let cleanup = RemoveFile(path.clone());
     let path_str = path.to_string_lossy().to_string();
     let args = vec![
         "-e".to_string(),
@@ -97,16 +166,30 @@ fn read_macos_image() -> Result<Option<Vec<u8>>> {
     ];
 
     if run("osascript", &args, None).is_err() {
-        let _ = fs::remove_file(&path);
         return Ok(None);
     }
 
+    let size = fs::metadata(&path)?.len();
+    if size > MAX_COMMAND_INPUT_BYTES as u64 {
+        return Err(Error::LimitExceeded(format!(
+            "clipboard image exceeds {} byte limit",
+            MAX_COMMAND_INPUT_BYTES
+        )));
+    }
     let data = fs::read(&path)?;
-    let _ = fs::remove_file(&path);
+    drop(cleanup);
     if data.is_empty() {
         Ok(None)
     } else {
         Ok(Some(data))
+    }
+}
+
+struct RemoveFile(std::path::PathBuf);
+
+impl Drop for RemoveFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -142,5 +225,19 @@ mod tests {
             sha256_hex(b"pasteforward"),
             "78f5e7afb3df1001af7b63e844cdbd6a2b0aba819ba09269514790bcf8b70544"
         );
+    }
+
+    #[test]
+    fn x11_display_parser_accepts_only_local_socket_forms() {
+        assert_eq!(
+            x11_socket_path(":99.0").unwrap(),
+            std::path::PathBuf::from("/tmp/.X11-unix/X99")
+        );
+        assert_eq!(
+            x11_socket_path("unix:1").unwrap(),
+            std::path::PathBuf::from("/tmp/.X11-unix/X1")
+        );
+        assert!(x11_socket_path("example.test:0").is_none());
+        assert!(x11_socket_path(":bad").is_none());
     }
 }
