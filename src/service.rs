@@ -23,10 +23,21 @@ pub enum ServiceStatus {
 }
 
 pub fn install_service() -> Result<()> {
+    install_service_with_rollback_precondition(|| Ok(()))
+}
+
+pub fn install_service_with_rollback_precondition(
+    before_rollback: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     if cfg!(target_os = "macos") {
-        install_launch_agent(&launch_agent_path()?, MAC_LABEL, unsafe { libc_getuid() })
+        install_launch_agent(
+            &launch_agent_path()?,
+            MAC_LABEL,
+            unsafe { libc_getuid() },
+            before_rollback,
+        )
     } else if cfg!(target_os = "linux") {
-        install_systemd_user(&systemd_unit_path()?, LINUX_UNIT)
+        install_systemd_user(&systemd_unit_path()?, LINUX_UNIT, before_rollback)
     } else {
         Err(Error::UnsupportedPlatform(
             "services are supported on macOS launchd and Linux systemd user services".to_string(),
@@ -83,7 +94,12 @@ pub fn restart_service_if_installed() -> Result<()> {
     match service_status()? {
         ServiceStatus::Installed => {
             if cfg!(target_os = "macos") {
-                install_launch_agent(&launch_agent_path()?, MAC_LABEL, unsafe { libc_getuid() })?;
+                install_launch_agent(
+                    &launch_agent_path()?,
+                    MAC_LABEL,
+                    unsafe { libc_getuid() },
+                    || Ok(()),
+                )?;
             } else if cfg!(target_os = "linux") {
                 run(
                     "systemctl",

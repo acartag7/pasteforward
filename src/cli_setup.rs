@@ -5,7 +5,7 @@ use pasteforward::config::{
 };
 use pasteforward::doctor::{doctor_destination, local_doctor_problem, prepare_remote_directory};
 use pasteforward::error::{Error, Result};
-use pasteforward::service::install_service;
+use pasteforward::service::install_service_with_rollback_precondition;
 use pasteforward::validation::{validate_config, validate_destination_name, validate_remote_env};
 use std::collections::BTreeMap;
 
@@ -62,11 +62,15 @@ pub fn cmd_init(args: Vec<String>) -> Result<()> {
         None => prompt_yes_no("Install or restart the background service now?", true)?,
     };
     if should_install {
-        if let Err(error) = install_service() {
-            if had_config {
-                save_config(&previous_config)?;
-            } else {
-                remove_config()?;
+        let mut rollback_precondition_ran = false;
+        if let Err(error) = install_service_with_rollback_precondition(|| {
+            rollback_precondition_ran = true;
+            restore_config_with_retry(|| restore_previous_config(had_config, &previous_config))
+        }) {
+            if !rollback_precondition_ran {
+                if let Err(config_restore) = restore_previous_config(had_config, &previous_config) {
+                    return combine_service_and_config_restore_error(error, config_restore);
+                }
             }
             return Err(error);
         }
@@ -75,6 +79,37 @@ pub fn cmd_init(args: Vec<String>) -> Result<()> {
         println!("service install skipped");
     }
     Ok(())
+}
+
+fn restore_previous_config(
+    had_config: bool,
+    previous_config: &pasteforward::config::AppConfig,
+) -> Result<()> {
+    if had_config {
+        save_config(previous_config)
+    } else {
+        remove_config()
+    }
+}
+
+fn restore_config_with_retry(mut restore_config: impl FnMut() -> Result<()>) -> Result<()> {
+    match restore_config() {
+        Ok(()) => Ok(()),
+        Err(first) => restore_config().map_err(|second| {
+            Error::DoctorFailed(format!(
+                "configuration restoration failed twice ({first}; {second})"
+            ))
+        }),
+    }
+}
+
+fn combine_service_and_config_restore_error(
+    service_error: Error,
+    config_restore: Error,
+) -> Result<()> {
+    Err(Error::DoctorFailed(format!(
+        "service installation failed ({service_error}) and configuration restoration failed ({config_restore})"
+    )))
 }
 
 struct InitOptions {
@@ -128,4 +163,52 @@ fn parse_options(args: &[String]) -> Result<InitOptions> {
         i += 1;
     }
     Ok(options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn config_restoration_retries_inside_the_rollback_precondition() {
+        let restore_calls = Cell::new(0);
+        restore_config_with_retry(|| {
+            restore_calls.set(restore_calls.get() + 1);
+            if restore_calls.get() == 1 {
+                Err(Error::DoctorFailed("first restore failed".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(restore_calls.get(), 2);
+    }
+
+    #[test]
+    fn config_restoration_retry_preserves_both_failures() {
+        let restore_calls = Cell::new(0);
+        let result = restore_config_with_retry(|| {
+            restore_calls.set(restore_calls.get() + 1);
+            Err(Error::DoctorFailed(format!(
+                "restore attempt {} failed",
+                restore_calls.get()
+            )))
+        });
+        assert_eq!(restore_calls.get(), 2);
+        assert!(
+            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("restore attempt 1 failed") && message.contains("restore attempt 2 failed"))
+        );
+    }
+
+    #[test]
+    fn pre_activation_restore_failure_retains_the_service_error() {
+        let result = combine_service_and_config_restore_error(
+            Error::DoctorFailed("service activation failed".to_string()),
+            Error::DoctorFailed("config restore failed".to_string()),
+        );
+        assert!(
+            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("service activation failed") && message.contains("config restore failed"))
+        );
+    }
 }

@@ -35,7 +35,12 @@ struct LaunchActivationFailure {
     candidate_may_be_loaded: bool,
 }
 
-pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
+pub fn install_launch_agent(
+    plist: &Path,
+    label: &str,
+    uid: u32,
+    before_rollback: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     if let Some(parent) = plist.parent() {
         create_owner_only_dir(parent)?;
     }
@@ -75,19 +80,26 @@ pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
         wait_for_recorded_daemon_ready,
     );
     if let Err(failure) = result {
-        let candidate_cleanup =
-            cleanup_launch_candidate_if_needed(failure.candidate_may_be_loaded, || {
-                cleanup_launch_agent_candidate(label, uid)
-            });
-        let rollback = rollback_service_file(plist, previous.as_deref(), failure.error, || {
-            if was_running && previous.is_some() {
-                bootstrap_launch_agent(plist, uid)?;
-                wait_for_recorded_daemon_ready()
-            } else {
-                Ok(())
-            }
-        });
-        let rollback = combine_candidate_cleanup(candidate_cleanup, rollback);
+        let activation_error = failure.error.to_string();
+        let rollback = rollback_after_config_restore(
+            &activation_error,
+            || {
+                cleanup_launch_candidate_if_needed(failure.candidate_may_be_loaded, || {
+                    cleanup_launch_agent_candidate(label, uid)
+                })
+            },
+            before_rollback,
+            || {
+                rollback_service_file(plist, previous.as_deref(), failure.error, || {
+                    if was_running && previous.is_some() {
+                        bootstrap_launch_agent(plist, uid)?;
+                        wait_for_recorded_daemon_ready()
+                    } else {
+                        Ok(())
+                    }
+                })
+            },
+        )?;
         return complete_service_rollback(
             rollback,
             manual_daemon_pid,
@@ -181,17 +193,33 @@ fn bootstrap_launch_agent(plist: &Path, uid: u32) -> Result<()> {
     Ok(())
 }
 
-fn combine_candidate_cleanup(candidate_cleanup: Result<()>, rollback: Result<()>) -> Result<()> {
-    match (candidate_cleanup, rollback) {
-        (Ok(()), rollback) => rollback,
-        (Err(cleanup), Ok(())) => Err(cleanup),
-        (Err(cleanup), Err(rollback)) => Err(Error::DoctorFailed(format!(
-            "candidate service cleanup failed ({cleanup}) and service rollback failed ({rollback})"
+fn rollback_after_config_restore(
+    activation_error: &str,
+    cleanup_candidate: impl FnOnce() -> Result<()>,
+    restore_config: impl FnOnce() -> Result<()>,
+    restore_previous_service: impl FnOnce() -> Result<()>,
+) -> Result<Result<()>> {
+    let candidate_cleanup = cleanup_candidate();
+    let config_restore = restore_config();
+    match (candidate_cleanup, config_restore) {
+        (Ok(()), Ok(())) => Ok(restore_previous_service()),
+        (Err(cleanup), Ok(())) => Err(Error::DoctorFailed(format!(
+            "service activation failed ({activation_error}) and candidate cleanup failed ({cleanup})"
+        ))),
+        (Ok(()), Err(config)) => Err(Error::DoctorFailed(format!(
+            "service activation failed ({activation_error}) and configuration restoration failed ({config})"
+        ))),
+        (Err(cleanup), Err(config)) => Err(Error::DoctorFailed(format!(
+            "service activation failed ({activation_error}), candidate cleanup failed ({cleanup}), and configuration restoration failed ({config})"
         ))),
     }
 }
 
-pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
+pub fn install_systemd_user(
+    unit: &Path,
+    unit_name: &str,
+    before_rollback: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     if let Some(parent) = unit.parent() {
         create_owner_only_dir(parent)?;
     }
@@ -215,14 +243,22 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
         stop_recorded_daemon,
         wait_for_recorded_daemon_ready,
     ) {
-        let rollback = rollback_systemd_install(
-            unit,
-            previous.as_deref(),
-            error,
-            unit_name,
-            previous_state,
-            systemctl,
-        );
+        let activation_error = error.to_string();
+        let rollback = rollback_after_config_restore(
+            &activation_error,
+            || cleanup_systemd_candidate(unit_name, systemctl),
+            before_rollback,
+            || {
+                rollback_systemd_install(
+                    unit,
+                    previous.as_deref(),
+                    error,
+                    unit_name,
+                    previous_state,
+                    systemctl,
+                )
+            },
+        )?;
         return complete_service_rollback(
             rollback,
             manual_daemon_pid,
@@ -231,6 +267,13 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn cleanup_systemd_candidate(
+    unit_name: &str,
+    mut invoke_systemctl: impl FnMut(&[&str]) -> Result<()>,
+) -> Result<()> {
+    invoke_systemctl(&["disable", "--now", unit_name])
 }
 
 fn independent_manual_daemon_pid(
@@ -356,17 +399,8 @@ fn rollback_systemd_install(
     let previous_state = match previous_state {
         Some(state) => state,
         None => {
-            let cleanup = invoke_systemctl(&["disable", "--now", unit_name]);
             return rollback_service_file(unit, previous, original, || {
-                let reload = invoke_systemctl(&["daemon-reload"]);
-                match (cleanup, reload) {
-                    (Ok(()), Ok(())) => Ok(()),
-                    (Err(cleanup), Ok(())) => Err(cleanup),
-                    (Ok(()), Err(reload)) => Err(reload),
-                    (Err(cleanup), Err(reload)) => Err(Error::DoctorFailed(format!(
-                        "new service cleanup failed ({cleanup}) and systemd daemon reload failed ({reload})"
-                    ))),
-                }
+                invoke_systemctl(&["daemon-reload"])
             });
         }
     };
@@ -647,45 +681,24 @@ mod tests {
     }
 
     #[test]
-    fn launch_agent_rollback_retains_cleanup_and_restores_prior_states() {
+    fn launch_agent_cleanup_failure_blocks_prior_service_reactivation() {
         use std::cell::Cell;
 
-        let root = test_dir("launch-rollback");
-        create_owner_only_dir(&root).unwrap();
-        let path = root.join("service");
-        write_owner_only_atomic(&path, b"candidate").unwrap();
-        let prior_agent_restored = Cell::new(false);
-        let service_rollback = rollback_service_file(
-            &path,
-            Some(b"previous"),
-            Error::DoctorFailed("activation failed".to_string()),
+        let prior_agent_restore_attempted = Cell::new(false);
+        let result = rollback_after_config_restore(
+            "activation failed",
+            || Err(Error::DoctorFailed("candidate bootout failed".to_string())),
+            || Ok(()),
             || {
-                prior_agent_restored.set(true);
-                Ok(())
-            },
-        );
-        let rollback = combine_candidate_cleanup(
-            Err(Error::DoctorFailed("candidate bootout failed".to_string())),
-            service_rollback,
-        );
-        let manual_daemon_restored = Cell::new(false);
-        let result = complete_service_rollback(
-            rollback,
-            None,
-            |_| Ok(false),
-            || {
-                manual_daemon_restored.set(true);
+                prior_agent_restore_attempted.set(true);
                 Ok(())
             },
         );
 
-        assert!(prior_agent_restored.get());
-        assert!(!manual_daemon_restored.get());
-        assert_eq!(fs::read(&path).unwrap(), b"previous");
+        assert!(!prior_agent_restore_attempted.get());
         assert!(
-            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("candidate service cleanup failed"))
+            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("activation failed") && message.contains("candidate bootout failed"))
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -941,8 +954,76 @@ mod tests {
     }
 
     #[test]
-    fn new_systemd_rollback_reports_cleanup_and_reload_failures() {
-        let root = test_dir("new-double-failure");
+    fn systemd_candidate_cleanup_is_attempted_before_config_restoration() {
+        let mut trace = Vec::new();
+        let result = cleanup_systemd_candidate("pasteforward.service", |args| {
+            trace.push(
+                args.iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            );
+            Err(Error::DoctorFailed("candidate cleanup failed".to_string()))
+        });
+        assert!(
+            matches!(result, Err(Error::DoctorFailed(message)) if message == "candidate cleanup failed")
+        );
+        assert_eq!(
+            trace,
+            vec![vec!["disable", "--now", "pasteforward.service"]]
+        );
+    }
+
+    #[test]
+    fn config_restoration_precedes_prior_service_reactivation_and_blocks_it_on_failure() {
+        use std::cell::{Cell, RefCell};
+
+        let activation = Error::DoctorFailed("activation failed".to_string()).to_string();
+        let trace = RefCell::new(Vec::new());
+        let rollback = rollback_after_config_restore(
+            &activation,
+            || {
+                trace.borrow_mut().push("candidate-cleanup");
+                Ok(())
+            },
+            || {
+                trace.borrow_mut().push("config-restore");
+                Ok(())
+            },
+            || {
+                trace.borrow_mut().push("prior-service-restore");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(rollback.is_ok());
+        assert_eq!(
+            trace.into_inner(),
+            vec![
+                "candidate-cleanup",
+                "config-restore",
+                "prior-service-restore"
+            ]
+        );
+
+        let prior_service_restored = Cell::new(false);
+        let result = rollback_after_config_restore(
+            &activation,
+            || Err(Error::DoctorFailed("candidate cleanup failed".to_string())),
+            || Err(Error::DoctorFailed("config restore failed".to_string())),
+            || {
+                prior_service_restored.set(true);
+                Ok(())
+            },
+        );
+        assert!(!prior_service_restored.get());
+        assert!(
+            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("activation failed") && message.contains("candidate cleanup failed") && message.contains("config restore failed"))
+        );
+    }
+
+    #[test]
+    fn new_systemd_rollback_reports_reload_failure_after_candidate_cleanup() {
+        let root = test_dir("new-reload-failure");
         create_owner_only_dir(&root).unwrap();
         let path = root.join("service");
         write_owner_only_atomic(&path, b"candidate").unwrap();
@@ -963,15 +1044,9 @@ mod tests {
             },
         );
         assert!(
-            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("new service cleanup failed") && message.contains("daemon reload failed"))
+            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("service state could not be restored"))
         );
-        assert_eq!(
-            trace,
-            vec![
-                vec!["disable", "--now", "pasteforward.service"],
-                vec!["daemon-reload"]
-            ]
-        );
+        assert_eq!(trace, vec![vec!["daemon-reload"]]);
         assert!(!path.exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -983,14 +1058,7 @@ mod tests {
                 .collect()
         };
         vec![
-            (
-                "new",
-                None,
-                commands(&[
-                    &["disable", "--now", "pasteforward.service"],
-                    &["daemon-reload"],
-                ]),
-            ),
+            ("new", None, commands(&[&["daemon-reload"]])),
             (
                 "persistent-running",
                 Some(SystemdState {
