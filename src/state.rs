@@ -15,12 +15,23 @@ struct StateLock {
 }
 
 fn lock_state() -> Result<StateLock> {
-    create_owner_only_dir(&state_dir()?)?;
+    prepare_state_directory()?;
     lock_file(&state_dir()?.join("daemon.lock"), true)
 }
 
+fn prepare_state_directory() -> Result<()> {
+    validate_state_directory(&state_dir()?, false)?;
+    create_owner_only_dir(&state_dir()?)
+}
+
 fn lock_state_existing() -> Result<Option<StateLock>> {
-    let path = state_dir()?.join("daemon.lock");
+    let directory = state_dir()?;
+    match fs::symlink_metadata(&directory) {
+        Ok(_) => validate_state_directory(&directory, true)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let path = directory.join("daemon.lock");
     match lock_file(&path, false) {
         Ok(lock) => Ok(Some(lock)),
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -50,11 +61,13 @@ fn lock_file_with_policy(
             .mode(0o600)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
-        if !file.metadata()?.is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
             return Err(Error::DoctorFailed(
                 "daemon state lock is not a regular file".to_string(),
             ));
         }
+        validate_owned_metadata(&metadata, !create, "daemon state lock")?;
         let mut acquired = false;
         for attempt in 0..attempts {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -91,6 +104,53 @@ fn lock_file_with_policy(
     Ok(StateLock { _file: file })
 }
 
+#[cfg(unix)]
+fn validate_state_directory(path: &Path, require_owner_only: bool) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !require_owner_only => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::DoctorFailed(
+            "daemon state directory is not a trusted directory".to_string(),
+        ));
+    }
+    validate_owned_metadata(&metadata, require_owner_only, "daemon state directory")
+}
+
+#[cfg(unix)]
+fn validate_owned_metadata(
+    metadata: &fs::Metadata,
+    require_owner_only: bool,
+    label: &str,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let expected_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != expected_uid {
+        return Err(Error::DoctorFailed(format!(
+            "{label} is not owned by the current user"
+        )));
+    }
+    if require_owner_only && !owner_mode_is_trusted(metadata.uid(), metadata.mode(), expected_uid) {
+        return Err(Error::DoctorFailed(format!("{label} is not owner-only")));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn owner_mode_is_trusted(uid: u32, mode: u32, expected_uid: u32) -> bool {
+    uid == expected_uid && mode & 0o077 == 0
+}
+
+#[cfg(not(unix))]
+fn validate_state_directory(_path: &Path, _require_owner_only: bool) -> Result<()> {
+    Ok(())
+}
+
 pub fn pid_path() -> Result<PathBuf> {
     Ok(state_dir()?.join("daemon.pid"))
 }
@@ -104,7 +164,7 @@ fn ready_path() -> Result<PathBuf> {
 }
 
 pub fn write_pid() -> Result<()> {
-    create_owner_only_dir(&state_dir()?)?;
+    prepare_state_directory()?;
     write_pid_at(
         &pid_path()?,
         &state_dir()?.join("daemon.lock"),
@@ -147,7 +207,7 @@ pub fn remove_pid() -> Result<()> {
 }
 
 pub fn read_pid_for_stop() -> Result<Option<u32>> {
-    create_owner_only_dir(&state_dir()?)?;
+    prepare_state_directory()?;
     read_pid_for_stop_at(
         &pid_path()?,
         &ready_path()?,
@@ -172,7 +232,7 @@ fn read_pid_for_stop_at(
 }
 
 pub fn clear_stopped_daemon_state(expected_pid: u32) -> Result<()> {
-    create_owner_only_dir(&state_dir()?)?;
+    prepare_state_directory()?;
     clear_stopped_daemon_state_at(
         &pid_path()?,
         &ready_path()?,
@@ -212,7 +272,7 @@ fn combine_state_cleanup(first: Result<()>, second: Result<()>) -> Result<()> {
 }
 
 pub fn write_daemon_ready() -> Result<()> {
-    create_owner_only_dir(&state_dir()?)?;
+    prepare_state_directory()?;
     write_daemon_ready_at(
         &ready_path()?,
         &state_dir()?.join("daemon.lock"),
@@ -459,6 +519,60 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         thread.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observational_lock_rejects_untrusted_modes_owners_and_file_types() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "pasteforward-observational-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut root_permissions = std::fs::metadata(&root).unwrap().permissions();
+        root_permissions.set_mode(0o700);
+        std::fs::set_permissions(&root, root_permissions).unwrap();
+        let lock_path = root.join("daemon.lock");
+
+        std::fs::write(&lock_path, b"").unwrap();
+        let mut lock_permissions = std::fs::metadata(&lock_path).unwrap().permissions();
+        lock_permissions.set_mode(0o666);
+        std::fs::set_permissions(&lock_path, lock_permissions).unwrap();
+        assert!(lock_file(&lock_path, false).is_err());
+
+        let metadata = std::fs::metadata(&lock_path).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert!(!owner_mode_is_trusted(
+            metadata.uid(),
+            0o600,
+            metadata.uid().wrapping_add(1)
+        ));
+        std::fs::remove_file(&lock_path).unwrap();
+
+        let target = root.join("target");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+        assert!(lock_file(&lock_path, false).is_err());
+        std::fs::remove_file(&lock_path).unwrap();
+
+        let fifo_path = CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        assert!(lock_file(&lock_path, false).is_err());
+        std::fs::remove_file(&lock_path).unwrap();
+
+        let mut root_permissions = std::fs::metadata(&root).unwrap().permissions();
+        root_permissions.set_mode(0o777);
+        std::fs::set_permissions(&root, root_permissions).unwrap();
+        assert!(validate_state_directory(&root, true).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
