@@ -2,8 +2,8 @@ use crate::command::run;
 use crate::config::{config_dir, create_owner_only_dir, state_dir, write_owner_only_atomic};
 use crate::error::{Error, Result};
 use crate::service::{
-    recorded_daemon_pid, recorded_daemon_pid_is_running, service_running, start_manual_daemon,
-    stop_recorded_daemon, wait_for_recorded_daemon_ready,
+    launch_agent_is_loaded, recorded_daemon_pid, recorded_daemon_pid_is_running,
+    start_manual_daemon, stop_recorded_daemon, wait_for_recorded_daemon_ready,
 };
 use crate::service_executable::{stable_executable_path, systemd_quote};
 use std::fs;
@@ -65,7 +65,7 @@ pub fn install_launch_agent(
         xml_escape(&stderr.to_string_lossy())
     );
     let previous = read_existing_service_file(plist)?;
-    let was_running = service_running();
+    let was_running = launch_agent_is_loaded(label, uid)?;
     let manual_daemon_pid = if was_running {
         None
     } else {
@@ -147,6 +147,10 @@ fn bootout_launch_agent(label: &str, uid: u32) -> Result<()> {
 }
 
 fn cleanup_launch_agent_candidate(label: &str, uid: u32) -> Result<()> {
+    unload_launch_agent_if_present(label, uid)
+}
+
+pub fn unload_launch_agent_if_present(label: &str, uid: u32) -> Result<()> {
     match run(
         "launchctl",
         &["bootout".to_string(), format!("gui/{uid}/{label}")],

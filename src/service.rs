@@ -1,6 +1,8 @@
-use crate::command::run;
+use crate::command::{CommandOutput, run};
 use crate::error::{Error, Result};
-use crate::service_install::{install_launch_agent, install_systemd_user};
+use crate::service_install::{
+    install_launch_agent, install_systemd_user, unload_launch_agent_if_present,
+};
 use crate::state::{
     clear_daemon_ready, clear_daemon_ready_for, clear_stopped_daemon_state, daemon_ready,
     process_alive, process_is_pasteforward_daemon, read_pid, read_pid_for_stop,
@@ -20,6 +22,18 @@ pub enum ServiceStatus {
     Installed,
     NotInstalled,
     Unknown(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceFileState {
+    Present,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SystemdUnitLoadState {
+    Loaded,
+    NotLoaded,
 }
 
 pub fn install_service() -> Result<()> {
@@ -48,46 +62,98 @@ pub fn install_service_with_rollback_precondition(
 pub fn uninstall_service() -> Result<()> {
     if cfg!(target_os = "macos") {
         let plist = launch_agent_path()?;
-        if service_running() {
-            run(
-                "launchctl",
-                &[
-                    "bootout".to_string(),
-                    format!("gui/{}/{}", unsafe { libc_getuid() }, MAC_LABEL),
-                ],
-                None,
-            )?;
-        }
+        let plist_state = regular_service_file_state(&plist, "launchd service definition")?;
+        unload_launch_agent_if_present(MAC_LABEL, unsafe { libc_getuid() })?;
         stop_recorded_daemon()?;
-        if plist.exists() {
+        if plist_state == ServiceFileState::Present {
             fs::remove_file(plist)?;
         }
         Ok(())
     } else if cfg!(target_os = "linux") {
         let unit = systemd_unit_path()?;
-        if unit.exists() {
-            run(
-                "systemctl",
-                &[
-                    "--user".to_string(),
-                    "disable".to_string(),
-                    "--now".to_string(),
-                    LINUX_UNIT.to_string(),
-                ],
-                None,
-            )?;
-            stop_recorded_daemon()?;
-            fs::remove_file(unit)?;
-            run(
-                "systemctl",
-                &["--user".to_string(), "daemon-reload".to_string()],
-                None,
-            )?;
-        }
-        Ok(())
+        let unit_state = regular_service_file_state(&unit, "systemd service definition")?;
+        uninstall_systemd_service(
+            unit_state,
+            LINUX_UNIT,
+            || systemd_unit_load_state(LINUX_UNIT),
+            run_systemctl_user,
+            stop_recorded_daemon,
+            || Ok(fs::remove_file(unit)?),
+        )
     } else {
         Ok(())
     }
+}
+
+fn uninstall_systemd_service(
+    unit_state: ServiceFileState,
+    unit_name: &str,
+    probe_load_state: impl FnOnce() -> Result<SystemdUnitLoadState>,
+    mut invoke_systemctl: impl FnMut(&[&str]) -> Result<()>,
+    stop_daemon: impl FnOnce() -> Result<()>,
+    remove_unit: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let unit_loaded = probe_load_state()?;
+    if unit_state == ServiceFileState::Missing && unit_loaded == SystemdUnitLoadState::NotLoaded {
+        return Ok(());
+    }
+    if unit_state == ServiceFileState::Present {
+        invoke_systemctl(&["disable", "--now", unit_name])?;
+    } else {
+        invoke_systemctl(&["stop", unit_name])?;
+    }
+    stop_daemon()?;
+    if unit_state == ServiceFileState::Present {
+        remove_unit()?;
+    }
+    invoke_systemctl(&["daemon-reload"])
+}
+
+fn regular_service_file_state(path: &Path, label: &str) -> Result<ServiceFileState> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(ServiceFileState::Present),
+        Ok(_) => Err(Error::DoctorFailed(format!(
+            "{label} is not a regular file"
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ServiceFileState::Missing),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn systemd_unit_load_state(unit_name: &str) -> Result<SystemdUnitLoadState> {
+    let output =
+        run_systemctl_user_output(&["show", "--property=LoadState", "--value", unit_name])?;
+    parse_systemd_unit_load_state(&output)
+}
+
+fn parse_systemd_unit_load_state(output: &CommandOutput) -> Result<SystemdUnitLoadState> {
+    let load_state = std::str::from_utf8(&output.stdout)
+        .map_err(|_| Error::DoctorFailed("systemd returned a non-UTF-8 load state".to_string()))?
+        .trim();
+    if load_state == "not-found" {
+        Ok(SystemdUnitLoadState::NotLoaded)
+    } else if load_state.is_empty() {
+        Err(Error::DoctorFailed(
+            "systemd omitted the unit load state".to_string(),
+        ))
+    } else {
+        Ok(SystemdUnitLoadState::Loaded)
+    }
+}
+
+fn run_systemctl_user(args: &[&str]) -> Result<()> {
+    run_systemctl_user_output(args)?;
+    Ok(())
+}
+
+fn run_systemctl_user_output(args: &[&str]) -> Result<CommandOutput> {
+    run(
+        "systemctl",
+        &std::iter::once("--user".to_string())
+            .chain(args.iter().map(|arg| (*arg).to_string()))
+            .collect::<Vec<_>>(),
+        None,
+    )
 }
 
 pub fn restart_service_if_installed() -> Result<()> {
@@ -137,15 +203,7 @@ pub fn service_status() -> Result<ServiceStatus> {
 
 pub fn service_running() -> bool {
     if cfg!(target_os = "macos") {
-        run(
-            "launchctl",
-            &[
-                "print".to_string(),
-                format!("gui/{}/{}", unsafe { libc_getuid() }, MAC_LABEL),
-            ],
-            None,
-        )
-        .is_ok()
+        launch_agent_is_loaded(MAC_LABEL, unsafe { libc_getuid() }).unwrap_or(false)
     } else if cfg!(target_os = "linux") {
         run(
             "systemctl",
@@ -161,6 +219,29 @@ pub fn service_running() -> bool {
     } else {
         false
     }
+}
+
+pub(crate) fn launch_agent_is_loaded(label: &str, uid: u32) -> Result<bool> {
+    match run(
+        "launchctl",
+        &["print".to_string(), format!("gui/{uid}/{label}")],
+        None,
+    ) {
+        Ok(_) => Ok(true),
+        Err(error) if launch_agent_is_not_loaded(&error, label) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn launch_agent_is_not_loaded(error: &Error, label: &str) -> bool {
+    matches!(
+        error,
+        Error::CommandFailed {
+            code: Some(113),
+            stderr,
+            ..
+        } if stderr.contains(&format!("Could not find service \"{label}\""))
+    )
 }
 
 pub(crate) fn stop_recorded_daemon() -> Result<()> {
@@ -405,6 +486,237 @@ unsafe fn libc_getuid() -> u32 {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_uninstall_stops_a_running_loaded_unit_after_its_file_is_removed() {
+        use std::cell::{Cell, RefCell};
+
+        let calls = RefCell::new(Vec::new());
+        let daemon_stopped = Cell::new(false);
+
+        uninstall_systemd_service(
+            ServiceFileState::Missing,
+            LINUX_UNIT,
+            || Ok(SystemdUnitLoadState::Loaded),
+            |args| {
+                calls.borrow_mut().push(
+                    args.iter()
+                        .map(|arg| (*arg).to_string())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(())
+            },
+            || {
+                daemon_stopped.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(daemon_stopped.get());
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                vec!["stop".to_string(), LINUX_UNIT.to_string()],
+                vec!["daemon-reload".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn systemd_uninstall_removes_an_inactive_unit_file() {
+        use std::cell::{Cell, RefCell};
+
+        let calls = RefCell::new(Vec::new());
+        let daemon_stopped = Cell::new(false);
+        let unit_removed = Cell::new(false);
+
+        uninstall_systemd_service(
+            ServiceFileState::Present,
+            LINUX_UNIT,
+            || Ok(SystemdUnitLoadState::NotLoaded),
+            |args| {
+                calls.borrow_mut().push(
+                    args.iter()
+                        .map(|arg| (*arg).to_string())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(())
+            },
+            || {
+                daemon_stopped.set(true);
+                Ok(())
+            },
+            || {
+                unit_removed.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(daemon_stopped.get());
+        assert!(unit_removed.get());
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                vec![
+                    "disable".to_string(),
+                    "--now".to_string(),
+                    LINUX_UNIT.to_string()
+                ],
+                vec!["daemon-reload".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn systemd_uninstall_keeps_the_missing_inactive_unit_path_a_no_op() {
+        use std::cell::Cell;
+
+        let invoked_systemctl = Cell::new(false);
+        let stopped_daemon = Cell::new(false);
+        uninstall_systemd_service(
+            ServiceFileState::Missing,
+            LINUX_UNIT,
+            || Ok(SystemdUnitLoadState::NotLoaded),
+            |_| {
+                invoked_systemctl.set(true);
+                Ok(())
+            },
+            || {
+                stopped_daemon.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(!invoked_systemctl.get());
+        assert!(!stopped_daemon.get());
+    }
+
+    #[test]
+    fn systemd_uninstall_propagates_manager_probe_failures_before_cleanup() {
+        use std::cell::Cell;
+
+        let invoked_systemctl = Cell::new(false);
+        let stopped_daemon = Cell::new(false);
+        let removed_unit = Cell::new(false);
+        let result = uninstall_systemd_service(
+            ServiceFileState::Missing,
+            LINUX_UNIT,
+            || Err(Error::DoctorFailed("user manager unavailable".to_string())),
+            |_| {
+                invoked_systemctl.set(true);
+                Ok(())
+            },
+            || {
+                stopped_daemon.set(true);
+                Ok(())
+            },
+            || {
+                removed_unit.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::DoctorFailed(message)) if message == "user manager unavailable")
+        );
+        assert!(!invoked_systemctl.get());
+        assert!(!stopped_daemon.get());
+        assert!(!removed_unit.get());
+    }
+
+    #[test]
+    fn systemd_uninstall_does_not_remove_the_unit_after_daemon_stop_failure() {
+        use std::cell::{Cell, RefCell};
+
+        let calls = RefCell::new(Vec::new());
+        let removed_unit = Cell::new(false);
+        let result = uninstall_systemd_service(
+            ServiceFileState::Present,
+            LINUX_UNIT,
+            || Ok(SystemdUnitLoadState::Loaded),
+            |args| {
+                calls.borrow_mut().push(
+                    args.iter()
+                        .map(|arg| (*arg).to_string())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(())
+            },
+            || Err(Error::DoctorFailed("daemon stop failed".to_string())),
+            || {
+                removed_unit.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::DoctorFailed(message)) if message == "daemon stop failed")
+        );
+        assert!(!removed_unit.get());
+        assert_eq!(
+            calls.into_inner(),
+            vec![vec![
+                "disable".to_string(),
+                "--now".to_string(),
+                LINUX_UNIT.to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn regular_service_file_state_rejects_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "pasteforward-service-file-state-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        let link = root.join("service");
+        fs::write(&target, b"unit").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(regular_service_file_state(&link, "systemd service definition").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn systemd_load_state_parser_accepts_only_not_found_as_absent() {
+        assert_eq!(
+            parse_systemd_unit_load_state(&CommandOutput {
+                stdout: b"not-found\n".to_vec(),
+            })
+            .unwrap(),
+            SystemdUnitLoadState::NotLoaded
+        );
+        assert_eq!(
+            parse_systemd_unit_load_state(&CommandOutput {
+                stdout: b"loaded\n".to_vec(),
+            })
+            .unwrap(),
+            SystemdUnitLoadState::Loaded
+        );
+        assert!(parse_systemd_unit_load_state(&CommandOutput { stdout: vec![] }).is_err());
+    }
+
+    #[test]
+    fn launchd_absence_requires_the_typed_not_loaded_error() {
+        let absent = Error::CommandFailed {
+            program: "launchctl".to_string(),
+            args: vec![],
+            code: Some(113),
+            stderr: "Could not find service \"pasteforward\" in domain".to_string(),
+        };
+        assert!(launch_agent_is_not_loaded(&absent, "pasteforward"));
+        let manager_error = Error::CommandFailed {
+            program: "launchctl".to_string(),
+            args: vec![],
+            code: Some(113),
+            stderr: "could not contact service manager".to_string(),
+        };
+        assert!(!launch_agent_is_not_loaded(&manager_error, "pasteforward"));
+    }
 
     #[test]
     fn managed_readiness_stability_resets_when_pid_changes() {
