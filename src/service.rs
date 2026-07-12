@@ -3,7 +3,9 @@ use crate::error::{Error, Result};
 use crate::service_install::{install_launch_agent, install_systemd_user};
 use crate::state::{pid_path, process_alive, process_is_pasteforward_daemon, read_pid};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -176,6 +178,48 @@ pub(crate) fn stop_recorded_daemon() -> Result<()> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+pub(crate) fn recorded_daemon_running() -> Result<bool> {
+    let Some(pid) = read_pid()? else {
+        return Ok(false);
+    };
+    Ok(process_alive(pid) && process_is_pasteforward_daemon(pid))
+}
+
+#[cfg(unix)]
+pub(crate) fn start_manual_daemon(executable: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new(executable);
+    command
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    for _ in 0..50 {
+        if recorded_daemon_running()? {
+            return Ok(());
+        }
+        if child.try_wait()?.is_some() {
+            return Err(Error::DoctorFailed(
+                "manual daemon exited while service rollback was restoring it".to_string(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(Error::DoctorFailed(
+        "manual daemon did not become ready during service rollback".to_string(),
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn start_manual_daemon(_executable: &Path) -> Result<()> {
+    Err(Error::UnsupportedPlatform(
+        "manual daemon restoration is supported only on Unix".to_string(),
+    ))
 }
 
 #[cfg(unix)]

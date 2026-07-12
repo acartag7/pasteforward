@@ -1,7 +1,9 @@
 use crate::command::run;
 use crate::config::{config_dir, create_owner_only_dir, state_dir, write_owner_only_atomic};
 use crate::error::{Error, Result};
-use crate::service::{service_running, stop_recorded_daemon};
+use crate::service::{
+    recorded_daemon_running, service_running, start_manual_daemon, stop_recorded_daemon,
+};
 use crate::service_executable::{stable_executable_path, systemd_quote};
 use std::fs;
 use std::io::Read;
@@ -105,9 +107,11 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
         .as_ref()
         .map(|_| systemd_unit_state(unit_name))
         .transpose()?;
+    let manual_daemon_was_running =
+        manual_daemon_is_independent(recorded_daemon_running()?, previous_state);
     write_owner_only_atomic(unit, content.as_bytes())?;
     if let Err(error) = activate_systemd(unit_name, systemctl, stop_recorded_daemon) {
-        return rollback_systemd_install(
+        let rollback = rollback_systemd_install(
             unit,
             previous.as_deref(),
             error,
@@ -115,8 +119,47 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
             previous_state,
             systemctl,
         );
+        return complete_systemd_rollback(
+            rollback,
+            manual_daemon_was_running,
+            recorded_daemon_running,
+            || start_manual_daemon(&exe),
+        );
     }
     Ok(())
+}
+
+fn manual_daemon_is_independent(
+    recorded_daemon_is_running: bool,
+    previous_state: Option<SystemdState>,
+) -> bool {
+    recorded_daemon_is_running
+        && previous_state.is_none_or(|state| state.activity != SystemdActivity::Active)
+}
+
+fn complete_systemd_rollback(
+    rollback: Result<()>,
+    manual_daemon_was_running: bool,
+    check_manual_daemon: impl FnOnce() -> Result<bool>,
+    restart_manual_daemon: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let manual_restore = if !manual_daemon_was_running {
+        Ok(())
+    } else {
+        match check_manual_daemon() {
+            Ok(true) => Ok(()),
+            Ok(false) => restart_manual_daemon(),
+            Err(error) => Err(error),
+        }
+    };
+    match (rollback, manual_restore) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(rollback), Ok(())) => Err(rollback),
+        (Ok(()), Err(manual)) => Err(manual),
+        (Err(rollback), Err(manual)) => Err(Error::DoctorFailed(format!(
+            "service rollback failed ({rollback}) and the previous manual daemon could not be restored ({manual})"
+        ))),
+    }
 }
 
 fn activate_systemd(
@@ -410,6 +453,121 @@ mod tests {
                 "enable pasteforward.service",
                 "start pasteforward.service",
             ]
+        );
+    }
+
+    #[test]
+    fn systemd_activation_propagates_every_handoff_failure() {
+        use std::cell::{Cell, RefCell};
+
+        let expected = [
+            vec!["daemon-reload"],
+            vec!["daemon-reload", "stop pasteforward.service"],
+            vec![
+                "daemon-reload",
+                "stop pasteforward.service",
+                "stop-recorded-daemon",
+                "enable pasteforward.service",
+            ],
+            vec![
+                "daemon-reload",
+                "stop pasteforward.service",
+                "stop-recorded-daemon",
+                "enable pasteforward.service",
+                "start pasteforward.service",
+            ],
+        ];
+        for (fail_at, expected_trace) in expected.into_iter().enumerate() {
+            let trace = RefCell::new(Vec::new());
+            let systemctl_index = Cell::new(0);
+            let result = activate_systemd(
+                "pasteforward.service",
+                |args| {
+                    trace.borrow_mut().push(args.join(" "));
+                    let current = systemctl_index.get();
+                    systemctl_index.set(current + 1);
+                    if current == fail_at {
+                        Err(Error::DoctorFailed(
+                            "injected systemctl failure".to_string(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    trace.borrow_mut().push("stop-recorded-daemon".to_string());
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(trace.into_inner(), expected_trace);
+        }
+
+        let trace = RefCell::new(Vec::new());
+        let result = activate_systemd(
+            "pasteforward.service",
+            |args| {
+                trace.borrow_mut().push(args.join(" "));
+                Ok(())
+            },
+            || {
+                trace.borrow_mut().push("stop-recorded-daemon".to_string());
+                Err(Error::DoctorFailed(
+                    "injected daemon-stop failure".to_string(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            trace.into_inner(),
+            vec![
+                "daemon-reload",
+                "stop pasteforward.service",
+                "stop-recorded-daemon"
+            ]
+        );
+    }
+
+    #[test]
+    fn manual_daemon_state_is_restored_after_systemd_rollback() {
+        use std::cell::Cell;
+
+        let inactive = SystemdState {
+            enablement: SystemdEnablement::Persistent,
+            activity: SystemdActivity::Inactive,
+        };
+        let active = SystemdState {
+            enablement: SystemdEnablement::Persistent,
+            activity: SystemdActivity::Active,
+        };
+        assert!(manual_daemon_is_independent(true, None));
+        assert!(manual_daemon_is_independent(true, Some(inactive)));
+        assert!(!manual_daemon_is_independent(true, Some(active)));
+        assert!(!manual_daemon_is_independent(false, None));
+
+        let restarted = Cell::new(false);
+        let result = complete_systemd_rollback(
+            Err(Error::DoctorFailed("activation failed".to_string())),
+            true,
+            || Ok(false),
+            || {
+                restarted.set(true);
+                Ok(())
+            },
+        );
+        assert!(restarted.get());
+        assert!(
+            matches!(result, Err(Error::DoctorFailed(message)) if message == "activation failed")
+        );
+
+        let result = complete_systemd_rollback(
+            Err(Error::DoctorFailed("activation failed".to_string())),
+            true,
+            || Ok(false),
+            || Err(Error::DoctorFailed("restart failed".to_string())),
+        );
+        assert!(
+            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("previous manual daemon could not be restored"))
         );
     }
 

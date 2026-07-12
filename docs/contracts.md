@@ -132,7 +132,8 @@ launchd or systemd pointing at a removed versioned path.
 manager before activation. Reinstalling a systemd unit repairs `failed` units
 as stopped units. If activation fails, the previous service file, persistent or
 runtime enablement, and active or stopped state are restored; cleanup and daemon
-reload are both attempted on every rollback path.
+reload are both attempted on every rollback path. An independently running
+manual daemon that was stopped for the handoff is restarted if activation fails.
 
 `install-service` and `uninstall-service` change only the local user service.
 They never add, delete, or purge destinations or history.
