@@ -134,6 +134,10 @@ as stopped units. If activation fails, the previous service file, persistent or
 runtime enablement, and active or stopped state are restored; cleanup and daemon
 reload are both attempted on every rollback path. An independently running
 manual daemon that was stopped for the handoff is restarted if activation fails.
+Restoration reports success only after the daemon publishes a PID-bound ready
+marker following local-backend and config initialization and remains healthy for
+a bounded stability window; platform-service activation uses the same readiness
+bar. Failed or timed-out manual starts are terminated and reaped.
 
 `install-service` and `uninstall-service` change only the local user service.
 They never add, delete, or purge destinations or history.

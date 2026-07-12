@@ -3,6 +3,7 @@ use crate::config::{config_dir, create_owner_only_dir, state_dir, write_owner_on
 use crate::error::{Error, Result};
 use crate::service::{
     recorded_daemon_running, service_running, start_manual_daemon, stop_recorded_daemon,
+    wait_for_recorded_daemon_ready,
 };
 use crate::service_executable::{stable_executable_path, systemd_quote};
 use std::fs;
@@ -110,7 +111,12 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
     let manual_daemon_was_running =
         manual_daemon_is_independent(recorded_daemon_running()?, previous_state);
     write_owner_only_atomic(unit, content.as_bytes())?;
-    if let Err(error) = activate_systemd(unit_name, systemctl, stop_recorded_daemon) {
+    if let Err(error) = activate_systemd(
+        unit_name,
+        systemctl,
+        stop_recorded_daemon,
+        wait_for_recorded_daemon_ready,
+    ) {
         let rollback = rollback_systemd_install(
             unit,
             previous.as_deref(),
@@ -166,12 +172,14 @@ fn activate_systemd(
     unit_name: &str,
     mut invoke_systemctl: impl FnMut(&[&str]) -> Result<()>,
     stop_daemon: impl FnOnce() -> Result<()>,
+    wait_until_ready: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     invoke_systemctl(&["daemon-reload"])?;
     invoke_systemctl(&["stop", unit_name])?;
     stop_daemon()?;
     invoke_systemctl(&["enable", unit_name])?;
-    invoke_systemctl(&["start", unit_name])
+    invoke_systemctl(&["start", unit_name])?;
+    wait_until_ready()
 }
 
 fn systemctl(args: &[&str]) -> Result<()> {
@@ -442,6 +450,10 @@ mod tests {
                 trace.borrow_mut().push("stop-recorded-daemon".to_string());
                 Ok(())
             },
+            || {
+                trace.borrow_mut().push("wait-until-ready".to_string());
+                Ok(())
+            },
         )
         .unwrap();
         assert_eq!(
@@ -452,6 +464,7 @@ mod tests {
                 "stop-recorded-daemon",
                 "enable pasteforward.service",
                 "start pasteforward.service",
+                "wait-until-ready",
             ]
         );
     }
@@ -498,6 +511,10 @@ mod tests {
                     trace.borrow_mut().push("stop-recorded-daemon".to_string());
                     Ok(())
                 },
+                || {
+                    trace.borrow_mut().push("wait-until-ready".to_string());
+                    Ok(())
+                },
             );
             assert!(result.is_err());
             assert_eq!(trace.into_inner(), expected_trace);
@@ -516,6 +533,10 @@ mod tests {
                     "injected daemon-stop failure".to_string(),
                 ))
             },
+            || {
+                trace.borrow_mut().push("wait-until-ready".to_string());
+                Ok(())
+            },
         );
         assert!(result.is_err());
         assert_eq!(
@@ -524,6 +545,37 @@ mod tests {
                 "daemon-reload",
                 "stop pasteforward.service",
                 "stop-recorded-daemon"
+            ]
+        );
+
+        let trace = RefCell::new(Vec::new());
+        let result = activate_systemd(
+            "pasteforward.service",
+            |args| {
+                trace.borrow_mut().push(args.join(" "));
+                Ok(())
+            },
+            || {
+                trace.borrow_mut().push("stop-recorded-daemon".to_string());
+                Ok(())
+            },
+            || {
+                trace.borrow_mut().push("wait-until-ready".to_string());
+                Err(Error::DoctorFailed(
+                    "injected readiness failure".to_string(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            trace.into_inner(),
+            vec![
+                "daemon-reload",
+                "stop pasteforward.service",
+                "stop-recorded-daemon",
+                "enable pasteforward.service",
+                "start pasteforward.service",
+                "wait-until-ready",
             ]
         );
     }

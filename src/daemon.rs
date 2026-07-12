@@ -4,7 +4,7 @@ use crate::config::{AppConfig, DestinationConfig, load_config};
 use crate::error::Result;
 use crate::history::{append_transfer, read_history};
 use crate::remote::{read_clipboard_command, resolve_remote_mode, sync_remote_image_command};
-use crate::state::{remove_pid, write_pid};
+use crate::state::{remove_pid, write_daemon_ready, write_pid};
 use crate::validation::{validate_config, validate_destination};
 use std::collections::BTreeMap;
 use std::thread;
@@ -14,6 +14,8 @@ pub fn run_daemon() -> Result<()> {
     write_pid()?;
     let _cleanup = RemovePid;
     let backend = detect_local_backend()?;
+    let mut initial_config = Some(load_config()?);
+    write_daemon_ready()?;
     let mut last_success = BTreeMap::<String, String>::new();
     let mut retry_after = BTreeMap::<String, (String, Instant)>::new();
     let mut last_cleanup = Instant::now() - Duration::from_secs(3600);
@@ -24,7 +26,11 @@ pub fn run_daemon() -> Result<()> {
     );
 
     loop {
-        let config = load_config()?;
+        let config = if let Some(config) = initial_config.take() {
+            config
+        } else {
+            load_config()?
+        };
         let interval = Duration::from_millis(config.daemon.interval_millis.max(250));
 
         if let Some(image) = read_image(&backend)? {

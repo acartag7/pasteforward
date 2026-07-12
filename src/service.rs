@@ -1,7 +1,10 @@
 use crate::command::run;
 use crate::error::{Error, Result};
 use crate::service_install::{install_launch_agent, install_systemd_user};
-use crate::state::{pid_path, process_alive, process_is_pasteforward_daemon, read_pid};
+use crate::state::{
+    clear_daemon_ready, daemon_ready, pid_path, process_alive, process_is_pasteforward_daemon,
+    read_pid,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -184,13 +187,41 @@ pub(crate) fn recorded_daemon_running() -> Result<bool> {
     let Some(pid) = read_pid()? else {
         return Ok(false);
     };
-    Ok(process_alive(pid) && process_is_pasteforward_daemon(pid))
+    Ok(recorded_daemon_pid_running(pid))
+}
+
+fn recorded_daemon_pid_running(expected_pid: u32) -> bool {
+    process_alive(expected_pid) && process_is_pasteforward_daemon(expected_pid)
+}
+
+pub(crate) fn wait_for_recorded_daemon_ready() -> Result<()> {
+    let mut stable_ready_checks = 0;
+    for _ in 0..50 {
+        let ready = if let Some(pid) = read_pid()? {
+            daemon_ready(pid)? && process_alive(pid) && process_is_pasteforward_daemon(pid)
+        } else {
+            false
+        };
+        if ready {
+            stable_ready_checks += 1;
+            if stable_ready_checks >= 5 {
+                return Ok(());
+            }
+        } else {
+            stable_ready_checks = 0;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(Error::DoctorFailed(
+        "managed daemon did not become ready after service activation".to_string(),
+    ))
 }
 
 #[cfg(unix)]
 pub(crate) fn start_manual_daemon(executable: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
+    clear_daemon_ready()?;
     let mut command = Command::new(executable);
     command
         .arg("daemon")
@@ -199,20 +230,86 @@ pub(crate) fn start_manual_daemon(executable: &Path) -> Result<()> {
         .stderr(Stdio::null())
         .process_group(0);
     let mut child = command.spawn()?;
-    for _ in 0..50 {
-        if recorded_daemon_running()? {
-            return Ok(());
-        }
-        if child.try_wait()?.is_some() {
-            return Err(Error::DoctorFailed(
-                "manual daemon exited while service rollback was restoring it".to_string(),
-            ));
-        }
-        thread::sleep(Duration::from_millis(100));
+    let result = wait_for_manual_daemon_start(
+        &mut child,
+        50,
+        |child_pid| {
+            Ok(read_pid()? == Some(child_pid)
+                && daemon_ready(child_pid)?
+                && recorded_daemon_pid_running(child_pid))
+        },
+        || thread::sleep(Duration::from_millis(100)),
+    );
+    if let Err(original) = result {
+        return match clear_daemon_ready() {
+            Ok(()) => Err(original),
+            Err(cleanup) => Err(Error::DoctorFailed(format!(
+                "manual daemon restoration failed ({original}) and its readiness marker could not be removed ({cleanup})"
+            ))),
+        };
     }
-    Err(Error::DoctorFailed(
-        "manual daemon did not become ready during service rollback".to_string(),
-    ))
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_manual_daemon_start(
+    child: &mut std::process::Child,
+    attempts: usize,
+    mut is_ready: impl FnMut(u32) -> Result<bool>,
+    mut pause: impl FnMut(),
+) -> Result<()> {
+    let child_pid = child.id();
+    let mut stable_ready_checks = 0;
+    for _ in 0..attempts {
+        let observation = (|| -> Result<bool> {
+            if child.try_wait()?.is_some() {
+                return Err(Error::DoctorFailed(
+                    "manual daemon exited while service rollback was restoring it".to_string(),
+                ));
+            }
+            is_ready(child_pid)
+        })();
+        match observation {
+            Ok(true) => {
+                stable_ready_checks += 1;
+                if stable_ready_checks >= 5 {
+                    return Ok(());
+                }
+            }
+            Ok(false) => stable_ready_checks = 0,
+            Err(error) => return fail_manual_daemon_start(child, error),
+        }
+        pause();
+    }
+    fail_manual_daemon_start(
+        child,
+        Error::DoctorFailed(
+            "manual daemon did not become ready during service rollback".to_string(),
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn fail_manual_daemon_start(child: &mut std::process::Child, original: Error) -> Result<()> {
+    let cleanup = match child.try_wait() {
+        Ok(Some(_)) => child.wait().map(|_| ()).map_err(Error::Io),
+        Ok(None) => child
+            .kill()
+            .and_then(|()| child.wait().map(|_| ()))
+            .map_err(Error::Io),
+        Err(probe) => match child.kill() {
+            Ok(()) => child.wait().map(|_| ()).map_err(Error::Io),
+            Err(kill) => Err(Error::DoctorFailed(format!(
+                "could not inspect spawned daemon ({probe}) or kill it ({kill})"
+            ))),
+        },
+    };
+    match cleanup {
+        Ok(()) => Err(original),
+        Err(cleanup) => Err(Error::DoctorFailed(format!(
+            "manual daemon restoration failed ({original}) and spawned-process cleanup failed ({cleanup})"
+        ))),
+    }
 }
 
 #[cfg(not(unix))]
@@ -277,4 +374,69 @@ unsafe fn libc_getuid() -> u32 {
 #[cfg(not(unix))]
 unsafe fn libc_getuid() -> u32 {
     0
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_daemon_supervisor_requires_stable_readiness() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let checks = std::cell::Cell::new(0);
+        wait_for_manual_daemon_start(
+            &mut child,
+            5,
+            |_| {
+                checks.set(checks.get() + 1);
+                Ok(true)
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(checks.get(), 5);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn manual_daemon_supervisor_reaps_immediate_and_late_exits() {
+        let mut immediate = Command::new("/usr/bin/false").spawn().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert!(wait_for_manual_daemon_start(&mut immediate, 5, |_| Ok(false), || {}).is_err());
+        assert!(immediate.try_wait().unwrap().is_some());
+
+        let mut late = Command::new("/bin/sleep").arg("0.05").spawn().unwrap();
+        assert!(
+            wait_for_manual_daemon_start(
+                &mut late,
+                10,
+                |_| Ok(true),
+                || thread::sleep(Duration::from_millis(20)),
+            )
+            .is_err()
+        );
+        assert!(late.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn manual_daemon_supervisor_cleans_up_timeout_and_probe_error() {
+        let mut timed_out = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        assert!(wait_for_manual_daemon_start(&mut timed_out, 2, |_| Ok(false), || {}).is_err());
+        assert!(timed_out.try_wait().unwrap().is_some());
+
+        let mut probe_error = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        assert!(
+            wait_for_manual_daemon_start(
+                &mut probe_error,
+                2,
+                |_| Err(Error::DoctorFailed(
+                    "injected readiness failure".to_string()
+                )),
+                || {},
+            )
+            .is_err()
+        );
+        assert!(probe_error.try_wait().unwrap().is_some());
+    }
 }

@@ -94,21 +94,41 @@ mod tests {
         assert_eq!(systemd_quote(Path::new("/tmp/a\"b")), "\"/tmp/a\\\"b\"");
     }
 
+    #[cfg(unix)]
     #[test]
     fn preserves_path_entry_instead_of_canonicalizing_it() {
+        use std::os::unix::fs::symlink;
+
         let dir = std::env::temp_dir().join(format!("pasteforward-path-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let executable = dir.join("pasteforward");
-        std::fs::write(&executable, b"test").unwrap();
-        make_executable(&executable);
+        let versioned = dir.join("pasteforward-0.2.0");
+        let stable = dir.join("pasteforward");
+        std::fs::write(&versioned, b"test").unwrap();
+        make_executable(&versioned);
+        symlink(&versioned, &stable).unwrap();
         let resolved = resolve_invoked_path(
             Path::new("pasteforward"),
             Some(dir.as_os_str()),
             Path::new("/unused"),
         )
         .unwrap();
-        assert_eq!(resolved, executable);
-        std::fs::remove_file(executable).unwrap();
+        assert_eq!(resolved, stable);
+
+        let mut permissions = std::fs::metadata(&versioned).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&versioned, permissions).unwrap();
+        assert!(
+            resolve_invoked_path(
+                Path::new("pasteforward"),
+                Some(dir.as_os_str()),
+                Path::new("/unused")
+            )
+            .is_err()
+        );
+
+        std::fs::remove_file(stable).unwrap();
+        std::fs::remove_file(versioned).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 

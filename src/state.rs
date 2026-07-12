@@ -11,6 +11,10 @@ pub fn status_path() -> Result<PathBuf> {
     Ok(state_dir()?.join("status.json"))
 }
 
+fn ready_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("daemon.ready"))
+}
+
 pub fn write_pid() -> Result<()> {
     create_owner_only_dir(&state_dir()?)?;
     let current_pid = std::process::id();
@@ -44,6 +48,30 @@ pub fn remove_pid() -> Result<()> {
         if recorded_pid.is_none_or(|pid| pid == current_pid) {
             fs::remove_file(path)?;
         }
+    }
+    clear_daemon_ready()?;
+    Ok(())
+}
+
+pub fn write_daemon_ready() -> Result<()> {
+    write_owner_only_atomic(&ready_path()?, std::process::id().to_string().as_bytes())
+}
+
+pub fn daemon_ready(pid: u32) -> Result<bool> {
+    let path = ready_path()?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    Ok(fs::read_to_string(path)?
+        .trim()
+        .parse::<u32>()
+        .is_ok_and(|ready_pid| ready_pid == pid))
+}
+
+pub fn clear_daemon_ready() -> Result<()> {
+    let path = ready_path()?;
+    if path.exists() {
+        fs::remove_file(path)?;
     }
     Ok(())
 }

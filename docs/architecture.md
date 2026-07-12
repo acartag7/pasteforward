@@ -66,6 +66,9 @@ executable. Service installation snapshots the previous manager state, stops a
 recorded daemon before activation, and rolls back the file plus exact systemd
 persistent/runtime enablement and active/stopped state on failure. A manual
 daemon stopped during a failed handoff is restarted as a detached process.
+The restart uses a PID-bound ready marker written after backend/config startup,
+then a bounded stability probe shared with normal service activation; failed
+manual children are killed and reaped.
 
 Plain SSH sessions work after the daemon is running; the remote terminal agent
 does not need to be launched through PasteForward.
