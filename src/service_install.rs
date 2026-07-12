@@ -81,7 +81,7 @@ pub fn install_launch_agent(
     );
     if let Err(failure) = result {
         let activation_error = failure.error.to_string();
-        let rollback = rollback_after_config_restore(
+        let rollback = match rollback_after_config_restore(
             &activation_error,
             || {
                 cleanup_launch_candidate_if_needed(failure.candidate_may_be_loaded, || {
@@ -107,7 +107,10 @@ pub fn install_launch_agent(
                     ))),
                 }
             },
-        )?;
+        ) {
+            Ok(rollback) => rollback,
+            Err(error) => Err(error),
+        };
         return complete_service_rollback(
             rollback,
             manual_daemon_pid,
@@ -260,7 +263,7 @@ pub fn install_systemd_user(
         wait_for_recorded_daemon_ready,
     ) {
         let activation_error = error.to_string();
-        let rollback = rollback_after_config_restore(
+        let rollback = match rollback_after_config_restore(
             &activation_error,
             || cleanup_systemd_candidate(unit_name, systemctl),
             before_rollback,
@@ -274,7 +277,10 @@ pub fn install_systemd_user(
                     ))),
                 }
             },
-        )?;
+        ) {
+            Ok(rollback) => rollback,
+            Err(error) => Err(error),
+        };
         return complete_service_rollback(
             rollback,
             manual_daemon_pid,

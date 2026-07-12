@@ -93,7 +93,16 @@ fn uninstall_systemd_service(
     stop_daemon: impl FnOnce() -> Result<()>,
     remove_unit: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    let unit_loaded = probe_load_state()?;
+    let unit_loaded = match probe_load_state() {
+        Ok(state) => state,
+        Err(error)
+            if unit_state == ServiceFileState::Missing
+                && systemd_user_manager_is_unavailable(&error) =>
+        {
+            SystemdUnitLoadState::NotLoaded
+        }
+        Err(error) => return Err(error),
+    };
     if unit_state == ServiceFileState::Missing && unit_loaded == SystemdUnitLoadState::NotLoaded {
         return Ok(());
     }
@@ -107,6 +116,14 @@ fn uninstall_systemd_service(
         remove_unit()?;
     }
     invoke_systemctl(&["daemon-reload"])
+}
+
+fn systemd_user_manager_is_unavailable(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::CommandFailed { stderr, .. }
+            if stderr.trim_start().starts_with("Failed to connect to bus:")
+    )
 }
 
 fn regular_service_file_state(path: &Path, label: &str) -> Result<ServiceFileState> {
@@ -625,6 +642,65 @@ mod tests {
         assert!(!invoked_systemctl.get());
         assert!(!stopped_daemon.get());
         assert!(!removed_unit.get());
+    }
+
+    #[test]
+    fn systemd_uninstall_allows_a_missing_unit_without_a_user_bus() {
+        use std::cell::Cell;
+
+        let invoked_systemctl = Cell::new(false);
+        let stopped_daemon = Cell::new(false);
+        uninstall_systemd_service(
+            ServiceFileState::Missing,
+            LINUX_UNIT,
+            || {
+                Err(Error::CommandFailed {
+                    program: "systemctl".to_string(),
+                    args: vec![],
+                    code: Some(1),
+                    stderr: "Failed to connect to bus: No medium found".to_string(),
+                })
+            },
+            |_| {
+                invoked_systemctl.set(true);
+                Ok(())
+            },
+            || {
+                stopped_daemon.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(!invoked_systemctl.get());
+        assert!(!stopped_daemon.get());
+    }
+
+    #[test]
+    fn systemd_uninstall_does_not_hide_user_bus_errors_for_present_units() {
+        use std::cell::Cell;
+
+        let invoked_systemctl = Cell::new(false);
+        let result = uninstall_systemd_service(
+            ServiceFileState::Present,
+            LINUX_UNIT,
+            || {
+                Err(Error::CommandFailed {
+                    program: "systemctl".to_string(),
+                    args: vec![],
+                    code: Some(1),
+                    stderr: "Failed to connect to bus: No medium found".to_string(),
+                })
+            },
+            |_| {
+                invoked_systemctl.set(true);
+                Ok(())
+            },
+            || Ok(()),
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!invoked_systemctl.get());
     }
 
     #[test]
