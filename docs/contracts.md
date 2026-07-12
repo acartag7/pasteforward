@@ -123,8 +123,16 @@ The daemon does not sync clipboard text.
 Only one daemon should run for a user. Startup refuses to replace a live daemon
 pid and overwrites stale pid files.
 
-Service definitions use a stable absolute executable path. Package upgrades
-must not leave launchd or systemd pointing at a removed versioned path.
+Service definitions use a stable absolute executable path that is a regular,
+executable file. PATH resolution skips non-executable shadow files and selects
+the same executable entry a shell can run. Package upgrades must not leave
+launchd or systemd pointing at a removed versioned path.
+
+`install-service` hands an existing recorded daemon over to the platform service
+manager before activation. Reinstalling a systemd unit repairs `failed` units
+as stopped units. If activation fails, the previous service file, persistent or
+runtime enablement, and active or stopped state are restored; cleanup and daemon
+reload are both attempted on every rollback path.
 
 `install-service` and `uninstall-service` change only the local user service.
 They never add, delete, or purge destinations or history.

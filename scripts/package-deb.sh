@@ -38,8 +38,8 @@ Priority: optional
 Description: Make image paste work in Claude Code and Codex over SSH.
 EOF
 printf '2.0\n' >"$tmp/debian-binary"
-tar -C "$tmp/control" -czf "$tmp/control.tar.gz" .
-tar -C "$tmp/data" -czf "$tmp/data.tar.gz" .
+tar --owner=0 --group=0 --numeric-owner -C "$tmp/control" -czf "$tmp/control.tar.gz" .
+tar --owner=0 --group=0 --numeric-owner -C "$tmp/data" -czf "$tmp/data.tar.gz" .
 mkdir -p dist
 OUTPUT="$ROOT/dist/pasteforward_${VERSION}_${DEB_ARCH}.deb"
 rm -f "$OUTPUT"

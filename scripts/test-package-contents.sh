@@ -24,6 +24,10 @@ data.tar.gz"
     ./usr/share/doc/pasteforward/LICENSE \
     ./usr/share/doc/pasteforward/README.md | sort)"
   test "$listing" = "$expected" || { echo "deb file manifest is not allowlisted" >&2; exit 1; }
+  for archive in control.tar.gz data.tar.gz; do
+    owners="$(ar p "$deb" "$archive" | tar --numeric-owner -tvzf - | awk '{print $2}' | sort -u)"
+    test "$owners" = "0/0" || { echo "deb archive ownership is not root:root" >&2; exit 1; }
+  done
 done
 
 for rpm in dist/pasteforward-*.rpm; do
@@ -38,6 +42,8 @@ for rpm in dist/pasteforward-*.rpm; do
   test "$listing" = "$expected" || { echo "rpm file manifest is not allowlisted" >&2; exit 1; }
   scripts="$(rpm -qp --scripts "$rpm")"
   test -z "$scripts"
+  owners="$(rpm -qp --qf '[%{FILEUSERNAME}:%{FILEGROUPNAME}\n]' "$rpm" | sort -u)"
+  test "$owners" = "root:root" || { echo "rpm archive ownership is not root:root" >&2; exit 1; }
 done
 
 if [ "${PASTEFORWARD_EXPECT_PACKAGES:-0}" = 1 ] && [ "$found" -eq 0 ]; then

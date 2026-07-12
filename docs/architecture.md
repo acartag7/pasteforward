@@ -61,7 +61,10 @@ are picked up without a schema migration step.
 
 The service adapter records a stable absolute executable path. It preserves the
 PATH-resolved symlink used to invoke the CLI instead of canonicalizing a
-package-manager version directory.
+package-manager version directory, while skipping PATH entries that are not
+executable. Service installation snapshots the previous manager state, stops a
+recorded daemon before activation, and rolls back the file plus exact systemd
+persistent/runtime enablement and active/stopped state on failure.
 
 Plain SSH sessions work after the daemon is running; the remote terminal agent
 does not need to be launched through PasteForward.

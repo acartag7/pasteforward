@@ -115,9 +115,12 @@ The supported install surfaces are:
 
 Homebrew formulae and native packages pin or embed the exact release artifact.
 Package maintainer scripts must not install, start, restart, or remove the user
-service.
+service. Native package archives record root ownership for installed binaries
+and documentation, independent of the build user's UID and GID.
 
-GitHub Actions must be pinned by commit SHA.
+GitHub Actions and reusable workflows must be pinned by commit SHA. Verification
+parses workflow YAML semantically and fails closed on aliases, malformed input,
+unbounded structure, symlinks, and dynamic or non-SHA remote `uses` values.
 
 The release remains draft until native packages and the Homebrew formula have
 been installed and run from the exact built artifacts. Publishing is protected

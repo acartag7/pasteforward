@@ -106,7 +106,7 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
         .map(|_| systemd_unit_state(unit_name))
         .transpose()?;
     write_owner_only_atomic(unit, content.as_bytes())?;
-    if let Err(error) = reload_and_enable_systemd(unit_name) {
+    if let Err(error) = activate_systemd(unit_name, systemctl, stop_recorded_daemon) {
         return rollback_systemd_install(
             unit,
             previous.as_deref(),
@@ -119,9 +119,16 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn reload_and_enable_systemd(unit_name: &str) -> Result<()> {
-    systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", "--now", unit_name])
+fn activate_systemd(
+    unit_name: &str,
+    mut invoke_systemctl: impl FnMut(&[&str]) -> Result<()>,
+    stop_daemon: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    invoke_systemctl(&["daemon-reload"])?;
+    invoke_systemctl(&["stop", unit_name])?;
+    stop_daemon()?;
+    invoke_systemctl(&["enable", unit_name])?;
+    invoke_systemctl(&["start", unit_name])
 }
 
 fn systemctl(args: &[&str]) -> Result<()> {
@@ -167,6 +174,9 @@ fn parse_systemd_state(output: &str) -> Result<SystemdState> {
                 activity = Some(SystemdActivity::Active)
             }
             ("ActiveState", "inactive") if activity.is_none() => {
+                activity = Some(SystemdActivity::Inactive)
+            }
+            ("ActiveState", "failed") if activity.is_none() => {
                 activity = Some(SystemdActivity::Inactive)
             }
             _ => {
@@ -362,9 +372,45 @@ mod tests {
             }
         );
         assert!(parse_systemd_state("UnitFileState=static\nActiveState=active\n").is_err());
+        assert_eq!(
+            parse_systemd_state("UnitFileState=enabled\nActiveState=failed\n").unwrap(),
+            SystemdState {
+                enablement: SystemdEnablement::Persistent,
+                activity: SystemdActivity::Inactive,
+            }
+        );
         assert!(parse_systemd_state("UnitFileState=enabled\nActiveState=activating\n").is_err());
         assert!(parse_systemd_state("UnitFileState=disabled\n").is_err());
         assert!(parse_systemd_state("").is_err());
+    }
+
+    #[test]
+    fn systemd_activation_stops_recorded_daemon_before_start() {
+        use std::cell::RefCell;
+
+        let trace = RefCell::new(Vec::new());
+        activate_systemd(
+            "pasteforward.service",
+            |args| {
+                trace.borrow_mut().push(args.join(" "));
+                Ok(())
+            },
+            || {
+                trace.borrow_mut().push("stop-recorded-daemon".to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            trace.into_inner(),
+            vec![
+                "daemon-reload",
+                "stop pasteforward.service",
+                "stop-recorded-daemon",
+                "enable pasteforward.service",
+                "start pasteforward.service",
+            ]
+        );
     }
 
     #[test]
