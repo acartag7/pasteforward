@@ -2,8 +2,8 @@ use crate::command::run;
 use crate::config::{config_dir, create_owner_only_dir, state_dir, write_owner_only_atomic};
 use crate::error::{Error, Result};
 use crate::service::{
-    recorded_daemon_running, service_running, start_manual_daemon, stop_recorded_daemon,
-    wait_for_recorded_daemon_ready,
+    recorded_daemon_pid, recorded_daemon_pid_is_running, service_running, start_manual_daemon,
+    stop_recorded_daemon, wait_for_recorded_daemon_ready,
 };
 use crate::service_executable::{stable_executable_path, systemd_quote};
 use std::fs;
@@ -32,7 +32,7 @@ struct SystemdState {
 #[derive(Debug)]
 struct LaunchActivationFailure {
     error: Error,
-    candidate_loaded: bool,
+    candidate_may_be_loaded: bool,
 }
 
 pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
@@ -61,7 +61,11 @@ pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
     );
     let previous = read_existing_service_file(plist)?;
     let was_running = service_running();
-    let manual_daemon_was_running = recorded_daemon_running()? && !was_running;
+    let manual_daemon_pid = if was_running {
+        None
+    } else {
+        recorded_daemon_pid()?
+    };
     write_owner_only_atomic(plist, content.as_bytes())?;
     let result = activate_launch_agent(
         was_running,
@@ -71,11 +75,10 @@ pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
         wait_for_recorded_daemon_ready,
     );
     if let Err(failure) = result {
-        let candidate_cleanup = if failure.candidate_loaded {
-            bootout_launch_agent(label, uid)
-        } else {
-            Ok(())
-        };
+        let candidate_cleanup =
+            cleanup_launch_candidate_if_needed(failure.candidate_may_be_loaded, || {
+                cleanup_launch_agent_candidate(label, uid)
+            });
         let rollback = rollback_service_file(plist, previous.as_deref(), failure.error, || {
             if was_running && previous.is_some() {
                 bootstrap_launch_agent(plist, uid)?;
@@ -87,8 +90,8 @@ pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
         let rollback = combine_candidate_cleanup(candidate_cleanup, rollback);
         return complete_service_rollback(
             rollback,
-            manual_daemon_was_running,
-            recorded_daemon_running,
+            manual_daemon_pid,
+            recorded_daemon_pid_is_running,
             || start_manual_daemon(&exe),
         );
     }
@@ -105,20 +108,20 @@ fn activate_launch_agent(
     if was_running {
         bootout_previous().map_err(|error| LaunchActivationFailure {
             error,
-            candidate_loaded: false,
+            candidate_may_be_loaded: false,
         })?;
     }
     stop_daemon().map_err(|error| LaunchActivationFailure {
         error,
-        candidate_loaded: false,
+        candidate_may_be_loaded: false,
     })?;
     bootstrap_candidate().map_err(|error| LaunchActivationFailure {
         error,
-        candidate_loaded: false,
+        candidate_may_be_loaded: true,
     })?;
     wait_until_ready().map_err(|error| LaunchActivationFailure {
         error,
-        candidate_loaded: true,
+        candidate_may_be_loaded: true,
     })
 }
 
@@ -129,6 +132,40 @@ fn bootout_launch_agent(label: &str, uid: u32) -> Result<()> {
         None,
     )?;
     Ok(())
+}
+
+fn cleanup_launch_agent_candidate(label: &str, uid: u32) -> Result<()> {
+    match run(
+        "launchctl",
+        &["bootout".to_string(), format!("gui/{uid}/{label}")],
+        None,
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) if launch_agent_is_absent(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn cleanup_launch_candidate_if_needed(
+    candidate_may_be_loaded: bool,
+    cleanup: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if candidate_may_be_loaded {
+        cleanup()
+    } else {
+        Ok(())
+    }
+}
+
+fn launch_agent_is_absent(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::CommandFailed {
+            code: Some(3),
+            stderr,
+            ..
+        } if stderr.contains("Boot-out failed: 3:") && stderr.contains("No such process")
+    )
 }
 
 fn bootstrap_launch_agent(plist: &Path, uid: u32) -> Result<()> {
@@ -170,8 +207,7 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
         .as_ref()
         .map(|_| systemd_unit_state(unit_name))
         .transpose()?;
-    let manual_daemon_was_running =
-        manual_daemon_is_independent(recorded_daemon_running()?, previous_state);
+    let manual_daemon_pid = independent_manual_daemon_pid(recorded_daemon_pid()?, previous_state);
     write_owner_only_atomic(unit, content.as_bytes())?;
     if let Err(error) = activate_systemd(
         unit_name,
@@ -189,36 +225,36 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
         );
         return complete_service_rollback(
             rollback,
-            manual_daemon_was_running,
-            recorded_daemon_running,
+            manual_daemon_pid,
+            recorded_daemon_pid_is_running,
             || start_manual_daemon(&exe),
         );
     }
     Ok(())
 }
 
-fn manual_daemon_is_independent(
-    recorded_daemon_is_running: bool,
+fn independent_manual_daemon_pid(
+    recorded_daemon_pid: Option<u32>,
     previous_state: Option<SystemdState>,
-) -> bool {
-    recorded_daemon_is_running
-        && previous_state.is_none_or(|state| state.activity != SystemdActivity::Active)
+) -> Option<u32> {
+    recorded_daemon_pid
+        .filter(|_| previous_state.is_none_or(|state| state.activity != SystemdActivity::Active))
 }
 
 fn complete_service_rollback(
     rollback: Result<()>,
-    manual_daemon_was_running: bool,
-    check_manual_daemon: impl FnOnce() -> Result<bool>,
+    manual_daemon_pid: Option<u32>,
+    check_manual_daemon: impl FnOnce(u32) -> Result<bool>,
     restart_manual_daemon: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    let manual_restore = if !manual_daemon_was_running {
-        Ok(())
-    } else {
-        match check_manual_daemon() {
+    let manual_restore = if let Some(manual_daemon_pid) = manual_daemon_pid {
+        match check_manual_daemon(manual_daemon_pid) {
             Ok(true) => Ok(()),
             Ok(false) => restart_manual_daemon(),
             Err(error) => Err(error),
         }
+    } else {
+        Ok(())
     };
     match (rollback, manual_restore) {
         (Ok(()), Ok(())) => Ok(()),
@@ -532,6 +568,46 @@ mod tests {
     }
 
     #[test]
+    fn launch_agent_bootstrap_errors_require_typed_candidate_cleanup() {
+        use std::cell::Cell;
+
+        let failure = activate_launch_agent(
+            false,
+            || Ok(()),
+            || Ok(()),
+            || {
+                Err(Error::CommandTimedOut {
+                    program: "launchctl".to_string(),
+                    seconds: 30,
+                })
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(failure.candidate_may_be_loaded);
+        let cleanup_invoked = Cell::new(false);
+        cleanup_launch_candidate_if_needed(failure.candidate_may_be_loaded, || {
+            cleanup_invoked.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(cleanup_invoked.get());
+
+        assert!(launch_agent_is_absent(&Error::CommandFailed {
+            program: "launchctl".to_string(),
+            args: Vec::new(),
+            code: Some(3),
+            stderr: "Boot-out failed: 3: No such process".to_string(),
+        }));
+        assert!(!launch_agent_is_absent(&Error::CommandFailed {
+            program: "launchctl".to_string(),
+            args: Vec::new(),
+            code: Some(1),
+            stderr: "permission denied".to_string(),
+        }));
+    }
+
+    #[test]
     fn launch_agent_activation_waits_for_readiness_after_daemon_handoff() {
         use std::cell::RefCell;
 
@@ -558,7 +634,7 @@ mod tests {
             },
         );
         let failure = result.unwrap_err();
-        assert!(failure.candidate_loaded);
+        assert!(failure.candidate_may_be_loaded);
         assert_eq!(
             trace.into_inner(),
             vec![
@@ -595,8 +671,8 @@ mod tests {
         let manual_daemon_restored = Cell::new(false);
         let result = complete_service_rollback(
             rollback,
-            false,
-            || Ok(false),
+            None,
+            |_| Ok(false),
             || {
                 manual_daemon_restored.set(true);
                 Ok(())
@@ -735,21 +811,31 @@ mod tests {
             enablement: SystemdEnablement::Persistent,
             activity: SystemdActivity::Active,
         };
-        assert!(manual_daemon_is_independent(true, None));
-        assert!(manual_daemon_is_independent(true, Some(inactive)));
-        assert!(!manual_daemon_is_independent(true, Some(active)));
-        assert!(!manual_daemon_is_independent(false, None));
+        assert_eq!(independent_manual_daemon_pid(Some(123), None), Some(123));
+        assert_eq!(
+            independent_manual_daemon_pid(Some(123), Some(inactive)),
+            Some(123)
+        );
+        assert_eq!(independent_manual_daemon_pid(Some(123), Some(active)), None);
+        assert_eq!(independent_manual_daemon_pid(None, None), None);
 
+        let original_manual_pid = 123;
+        let surviving_candidate_pid = 456;
+        let checked_pid = Cell::new(None);
         let restarted = Cell::new(false);
         let result = complete_service_rollback(
             Err(Error::DoctorFailed("activation failed".to_string())),
-            true,
-            || Ok(false),
+            Some(original_manual_pid),
+            |expected_pid| {
+                checked_pid.set(Some(expected_pid));
+                Ok(expected_pid == surviving_candidate_pid)
+            },
             || {
                 restarted.set(true);
                 Ok(())
             },
         );
+        assert_eq!(checked_pid.get(), Some(original_manual_pid));
         assert!(restarted.get());
         assert!(
             matches!(result, Err(Error::DoctorFailed(message)) if message == "activation failed")
@@ -757,8 +843,8 @@ mod tests {
 
         let result = complete_service_rollback(
             Err(Error::DoctorFailed("activation failed".to_string())),
-            true,
-            || Ok(false),
+            Some(123),
+            |_| Ok(false),
             || Err(Error::DoctorFailed("restart failed".to_string())),
         );
         assert!(

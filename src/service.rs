@@ -177,11 +177,15 @@ pub(crate) fn stop_recorded_daemon() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn recorded_daemon_running() -> Result<bool> {
+pub(crate) fn recorded_daemon_pid() -> Result<Option<u32>> {
     let Some(pid) = read_pid()? else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(recorded_daemon_pid_running(pid))
+    Ok(recorded_daemon_pid_running(pid).then_some(pid))
+}
+
+pub(crate) fn recorded_daemon_pid_is_running(expected_pid: u32) -> Result<bool> {
+    Ok(read_pid()? == Some(expected_pid) && recorded_daemon_pid_running(expected_pid))
 }
 
 fn recorded_daemon_pid_running(expected_pid: u32) -> bool {
@@ -243,11 +247,7 @@ pub(crate) fn start_manual_daemon(executable: &Path) -> Result<()> {
     let result = wait_for_manual_daemon_start(
         &mut child,
         50,
-        |child_pid| {
-            Ok(read_pid()? == Some(child_pid)
-                && daemon_ready(child_pid)?
-                && recorded_daemon_pid_running(child_pid))
-        },
+        |child_pid| Ok(daemon_ready(child_pid)? && recorded_daemon_pid_is_running(child_pid)?),
         || thread::sleep(Duration::from_millis(100)),
     );
     if let Err(original) = result {
