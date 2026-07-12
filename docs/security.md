@@ -65,7 +65,8 @@ Release build inputs are pinned:
   replacement; newly created directory components are mode `0700`.
 - Daemon PID/readiness markers are owner-only, no-follow regular files with a
   32-byte read cap; symlinks, FIFOs, devices, malformed values, and oversize
-  markers are rejected without blocking service activation.
+  markers are rejected without blocking service activation. PID and readiness
+  publication/cleanup are serialized by an owner-only no-follow process lock.
 
 ## Remote Command Allowlist
 

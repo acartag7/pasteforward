@@ -2,8 +2,8 @@ use crate::command::run;
 use crate::error::{Error, Result};
 use crate::service_install::{install_launch_agent, install_systemd_user};
 use crate::state::{
-    clear_daemon_ready, clear_daemon_ready_for, daemon_ready, pid_path, process_alive,
-    process_is_pasteforward_daemon, read_pid,
+    clear_daemon_ready, clear_daemon_ready_for, clear_stopped_daemon_state, daemon_ready,
+    process_alive, process_is_pasteforward_daemon, read_pid, read_pid_for_stop,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -148,17 +148,12 @@ pub fn service_running() -> bool {
 }
 
 pub(crate) fn stop_recorded_daemon() -> Result<()> {
-    let Some(pid) = read_pid()? else {
-        clear_daemon_ready()?;
+    let Some(pid) = read_pid_for_stop()? else {
         return Ok(());
     };
 
     if process_alive(pid) && !process_is_pasteforward_daemon(pid) {
-        let path = pid_path()?;
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        clear_daemon_ready_for(Some(pid))?;
+        clear_stopped_daemon_state(pid)?;
         return Ok(());
     }
 
@@ -178,11 +173,7 @@ pub(crate) fn stop_recorded_daemon() -> Result<()> {
         )));
     }
 
-    let path = pid_path()?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    clear_daemon_ready_for(Some(pid))?;
+    clear_stopped_daemon_state(pid)?;
     Ok(())
 }
 

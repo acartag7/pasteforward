@@ -1,10 +1,54 @@
 use crate::config::{create_owner_only_dir, state_dir, write_owner_only_atomic};
 use crate::error::{Error, Result};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const MAX_PID_MARKER_BYTES: u64 = 32;
+
+struct StateLock {
+    _file: File,
+}
+
+fn lock_state() -> Result<StateLock> {
+    create_owner_only_dir(&state_dir()?)?;
+    lock_file(&state_dir()?.join("daemon.lock"))
+}
+
+fn lock_file(path: &Path) -> Result<StateLock> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(Error::DoctorFailed(
+                "daemon state lock is not a regular file".to_string(),
+            ));
+        }
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)?;
+    Ok(StateLock { _file: file })
+}
 
 pub fn pid_path() -> Result<PathBuf> {
     Ok(state_dir()?.join("daemon.pid"))
@@ -19,9 +63,9 @@ fn ready_path() -> Result<PathBuf> {
 }
 
 pub fn write_pid() -> Result<()> {
-    create_owner_only_dir(&state_dir()?)?;
+    let _lock = lock_state()?;
     let current_pid = std::process::id();
-    if let Some(pid) = read_pid()? {
+    if let Some(pid) = read_pid_marker(&pid_path()?)? {
         if pid != current_pid && process_alive(pid) {
             return Err(Error::DoctorFailed(format!(
                 "pasteforward daemon is already running with pid {pid}"
@@ -33,30 +77,74 @@ pub fn write_pid() -> Result<()> {
 }
 
 pub fn read_pid() -> Result<Option<u32>> {
+    let _lock = lock_state()?;
     read_pid_marker(&pid_path()?)
 }
 
 pub fn remove_pid() -> Result<()> {
-    let path = pid_path()?;
-    if let Some(recorded_pid) = read_pid_marker(&path)? {
-        let current_pid = std::process::id();
-        if recorded_pid == current_pid {
+    let _lock = lock_state()?;
+    let current_pid = std::process::id();
+    let pid_cleanup = (|| -> Result<()> {
+        let path = pid_path()?;
+        if let Some(recorded_pid) = read_pid_marker(&path)? {
+            if recorded_pid == current_pid {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    })();
+    let ready_cleanup = clear_daemon_ready_for_unlocked(Some(current_pid));
+    combine_state_cleanup(pid_cleanup, ready_cleanup)
+}
+
+pub fn read_pid_for_stop() -> Result<Option<u32>> {
+    let _lock = lock_state()?;
+    let pid = read_pid_marker(&pid_path()?)?;
+    if pid.is_none() {
+        clear_daemon_ready_unlocked()?;
+    }
+    Ok(pid)
+}
+
+pub fn clear_stopped_daemon_state(expected_pid: u32) -> Result<()> {
+    let _lock = lock_state()?;
+    let pid_cleanup = (|| -> Result<()> {
+        let path = pid_path()?;
+        if read_pid_marker(&path)? == Some(expected_pid) {
             fs::remove_file(path)?;
         }
+        Ok(())
+    })();
+    let ready_cleanup = clear_daemon_ready_for_unlocked(Some(expected_pid));
+    combine_state_cleanup(pid_cleanup, ready_cleanup)
+}
+
+fn combine_state_cleanup(first: Result<()>, second: Result<()>) -> Result<()> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(Error::DoctorFailed(format!(
+            "daemon state cleanup failed for both markers ({first}; {second})"
+        ))),
     }
-    clear_daemon_ready_for(Some(std::process::id()))?;
-    Ok(())
 }
 
 pub fn write_daemon_ready() -> Result<()> {
+    let _lock = lock_state()?;
     write_owner_only_atomic(&ready_path()?, std::process::id().to_string().as_bytes())
 }
 
 pub fn daemon_ready(pid: u32) -> Result<bool> {
+    let _lock = lock_state()?;
     Ok(read_pid_marker(&ready_path()?)? == Some(pid))
 }
 
 pub fn clear_daemon_ready() -> Result<()> {
+    let _lock = lock_state()?;
+    clear_daemon_ready_unlocked()
+}
+
+fn clear_daemon_ready_unlocked() -> Result<()> {
     let path = ready_path()?;
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -66,8 +154,13 @@ pub fn clear_daemon_ready() -> Result<()> {
 }
 
 pub fn clear_daemon_ready_for(expected_pid: Option<u32>) -> Result<()> {
+    let _lock = lock_state()?;
+    clear_daemon_ready_for_unlocked(expected_pid)
+}
+
+fn clear_daemon_ready_for_unlocked(expected_pid: Option<u32>) -> Result<()> {
     if expected_pid.is_none() {
-        return clear_daemon_ready();
+        return clear_daemon_ready_unlocked();
     }
     let path = ready_path()?;
     let ready_pid = read_pid_marker(&path)?;
@@ -228,6 +321,38 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
         assert!(read_pid_marker(&fifo).is_err());
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_lock_serializes_marker_publication_and_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "pasteforward-state-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let lock_path = root.join("daemon.lock");
+        let first = lock_file(&lock_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _second = lock_file(&lock_path).unwrap();
+            sender.send(()).unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        drop(first);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        thread.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }
