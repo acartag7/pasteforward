@@ -63,6 +63,9 @@ Release build inputs are pinned:
   successful partial initialization.
 - Config reads use `O_NOFOLLOW`; config and service files use owner-only atomic
   replacement; newly created directory components are mode `0700`.
+- Daemon PID/readiness markers are owner-only, no-follow regular files with a
+  32-byte read cap; symlinks, FIFOs, devices, malformed values, and oversize
+  markers are rejected without blocking service activation.
 
 ## Remote Command Allowlist
 

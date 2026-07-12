@@ -15,7 +15,7 @@ mod unix {
         let fd = open_at(
             parent.as_raw_fd(),
             &name,
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
             0,
         )?;
         Ok(unsafe { File::from_raw_fd(fd) })

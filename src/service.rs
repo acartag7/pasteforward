@@ -2,8 +2,8 @@ use crate::command::run;
 use crate::error::{Error, Result};
 use crate::service_install::{install_launch_agent, install_systemd_user};
 use crate::state::{
-    clear_daemon_ready, daemon_ready, pid_path, process_alive, process_is_pasteforward_daemon,
-    read_pid,
+    clear_daemon_ready, clear_daemon_ready_for, daemon_ready, pid_path, process_alive,
+    process_is_pasteforward_daemon, read_pid,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -149,6 +149,7 @@ pub fn service_running() -> bool {
 
 pub(crate) fn stop_recorded_daemon() -> Result<()> {
     let Some(pid) = read_pid()? else {
+        clear_daemon_ready()?;
         return Ok(());
     };
 
@@ -157,6 +158,7 @@ pub(crate) fn stop_recorded_daemon() -> Result<()> {
         if path.exists() {
             fs::remove_file(path)?;
         }
+        clear_daemon_ready_for(Some(pid))?;
         return Ok(());
     }
 
@@ -180,6 +182,7 @@ pub(crate) fn stop_recorded_daemon() -> Result<()> {
     if path.exists() {
         fs::remove_file(path)?;
     }
+    clear_daemon_ready_for(Some(pid))?;
     Ok(())
 }
 
@@ -196,25 +199,41 @@ fn recorded_daemon_pid_running(expected_pid: u32) -> bool {
 
 pub(crate) fn wait_for_recorded_daemon_ready() -> Result<()> {
     let mut stable_ready_checks = 0;
+    let mut stable_pid = None;
     for _ in 0..50 {
-        let ready = if let Some(pid) = read_pid()? {
-            daemon_ready(pid)? && process_alive(pid) && process_is_pasteforward_daemon(pid)
+        let ready_pid = if let Some(pid) = read_pid()? {
+            (daemon_ready(pid)? && process_alive(pid) && process_is_pasteforward_daemon(pid))
+                .then_some(pid)
         } else {
-            false
+            None
         };
-        if ready {
-            stable_ready_checks += 1;
-            if stable_ready_checks >= 5 {
-                return Ok(());
-            }
-        } else {
-            stable_ready_checks = 0;
+        if record_stable_ready_pid(&mut stable_pid, &mut stable_ready_checks, ready_pid) {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
     Err(Error::DoctorFailed(
         "managed daemon did not become ready after service activation".to_string(),
     ))
+}
+
+fn record_stable_ready_pid(
+    stable_pid: &mut Option<u32>,
+    stable_ready_checks: &mut usize,
+    ready_pid: Option<u32>,
+) -> bool {
+    match ready_pid {
+        Some(pid) if *stable_pid == Some(pid) => *stable_ready_checks += 1,
+        Some(pid) => {
+            *stable_pid = Some(pid);
+            *stable_ready_checks = 1;
+        }
+        None => {
+            *stable_pid = None;
+            *stable_ready_checks = 0;
+        }
+    }
+    *stable_ready_checks >= 5
 }
 
 #[cfg(unix)]
@@ -241,7 +260,7 @@ pub(crate) fn start_manual_daemon(executable: &Path) -> Result<()> {
         || thread::sleep(Duration::from_millis(100)),
     );
     if let Err(original) = result {
-        return match clear_daemon_ready() {
+        return match clear_daemon_ready_for(Some(child.id())) {
             Ok(()) => Err(original),
             Err(cleanup) => Err(Error::DoctorFailed(format!(
                 "manual daemon restoration failed ({original}) and its readiness marker could not be removed ({cleanup})"
@@ -381,6 +400,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_readiness_stability_resets_when_pid_changes() {
+        let mut stable_pid = None;
+        let mut checks = 0;
+        for _ in 0..4 {
+            assert!(!record_stable_ready_pid(
+                &mut stable_pid,
+                &mut checks,
+                Some(101)
+            ));
+        }
+        assert!(!record_stable_ready_pid(
+            &mut stable_pid,
+            &mut checks,
+            Some(202)
+        ));
+        for _ in 0..3 {
+            assert!(!record_stable_ready_pid(
+                &mut stable_pid,
+                &mut checks,
+                Some(202)
+            ));
+        }
+        assert!(record_stable_ready_pid(
+            &mut stable_pid,
+            &mut checks,
+            Some(202)
+        ));
+    }
+
+    #[test]
     fn manual_daemon_supervisor_requires_stable_readiness() {
         let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let checks = std::cell::Cell::new(0);
@@ -406,13 +455,13 @@ mod tests {
         assert!(wait_for_manual_daemon_start(&mut immediate, 5, |_| Ok(false), || {}).is_err());
         assert!(immediate.try_wait().unwrap().is_some());
 
-        let mut late = Command::new("/bin/sleep").arg("0.05").spawn().unwrap();
+        let mut late = Command::new("/bin/sleep").arg("1").spawn().unwrap();
         assert!(
             wait_for_manual_daemon_start(
                 &mut late,
                 10,
                 |_| Ok(true),
-                || thread::sleep(Duration::from_millis(20)),
+                || thread::sleep(Duration::from_millis(300)),
             )
             .is_err()
         );

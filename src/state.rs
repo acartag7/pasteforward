@@ -1,7 +1,10 @@
 use crate::config::{create_owner_only_dir, state_dir, write_owner_only_atomic};
 use crate::error::{Error, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+const MAX_PID_MARKER_BYTES: u64 = 32;
 
 pub fn pid_path() -> Result<PathBuf> {
     Ok(state_dir()?.join("daemon.pid"))
@@ -30,26 +33,18 @@ pub fn write_pid() -> Result<()> {
 }
 
 pub fn read_pid() -> Result<Option<u32>> {
-    let path = pid_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let value = fs::read_to_string(path)?;
-    Ok(value.trim().parse::<u32>().ok())
+    read_pid_marker(&pid_path()?)
 }
 
 pub fn remove_pid() -> Result<()> {
     let path = pid_path()?;
-    if path.exists() {
+    if let Some(recorded_pid) = read_pid_marker(&path)? {
         let current_pid = std::process::id();
-        let recorded_pid = fs::read_to_string(&path)
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok());
-        if recorded_pid.is_none_or(|pid| pid == current_pid) {
+        if recorded_pid == current_pid {
             fs::remove_file(path)?;
         }
     }
-    clear_daemon_ready()?;
+    clear_daemon_ready_for(Some(std::process::id()))?;
     Ok(())
 }
 
@@ -58,22 +53,57 @@ pub fn write_daemon_ready() -> Result<()> {
 }
 
 pub fn daemon_ready(pid: u32) -> Result<bool> {
-    let path = ready_path()?;
-    if !path.exists() {
-        return Ok(false);
-    }
-    Ok(fs::read_to_string(path)?
-        .trim()
-        .parse::<u32>()
-        .is_ok_and(|ready_pid| ready_pid == pid))
+    Ok(read_pid_marker(&ready_path()?)? == Some(pid))
 }
 
 pub fn clear_daemon_ready() -> Result<()> {
     let path = ready_path()?;
-    if path.exists() {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn clear_daemon_ready_for(expected_pid: Option<u32>) -> Result<()> {
+    if expected_pid.is_none() {
+        return clear_daemon_ready();
+    }
+    let path = ready_path()?;
+    let ready_pid = read_pid_marker(&path)?;
+    if ready_pid.is_some() && (expected_pid.is_none() || ready_pid == expected_pid) {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+fn read_pid_marker(path: &Path) -> Result<Option<u32>> {
+    let mut file = match crate::secure_fs::open_read(path) {
+        Ok(file) => file,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_PID_MARKER_BYTES {
+        return Err(Error::DoctorFailed(
+            "daemon state marker is not a bounded regular file".to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_PID_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PID_MARKER_BYTES {
+        return Err(Error::DoctorFailed(
+            "daemon state marker exceeds its size limit".to_string(),
+        ));
+    }
+    let value = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| Error::DoctorFailed("daemon state marker is malformed".to_string()))?;
+    Ok(Some(value))
 }
 
 pub fn process_alive(pid: u32) -> bool {
@@ -147,6 +177,8 @@ fn process_alive_impl(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn current_process_is_alive() {
@@ -161,5 +193,41 @@ mod tests {
     #[test]
     fn current_test_process_is_not_the_daemon() {
         assert!(!process_is_pasteforward_daemon(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_markers_reject_symlinks_fifos_and_oversize_files() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "pasteforward-state-marker-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let valid = root.join("valid");
+        std::fs::write(&valid, b"123").unwrap();
+        assert_eq!(read_pid_marker(&valid).unwrap(), Some(123));
+
+        let oversized = root.join("oversized");
+        std::fs::write(&oversized, vec![b'1'; MAX_PID_MARKER_BYTES as usize + 1]).unwrap();
+        assert!(read_pid_marker(&oversized).is_err());
+
+        let symlink = root.join("symlink");
+        std::os::unix::fs::symlink(&valid, &symlink).unwrap();
+        assert!(read_pid_marker(&symlink).is_err());
+
+        let fifo = root.join("fifo");
+        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        assert!(read_pid_marker(&fifo).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
