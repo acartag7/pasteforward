@@ -29,6 +29,10 @@ Runtime dependencies are intentionally small:
 - `serde_json 1.0.150`, published 2026-05-21
 - `sha2 0.10.9`, published more than 7 days before 2026-06-09
 
+The Remotion demo pins the transitive development-only dependency `ws 8.21.0`,
+published 2026-05-22, to exclude vulnerable earlier 8.x releases. It is not
+linked into the PasteForward binary.
+
 The CLI is hand-rolled to avoid an argument-parser dependency in v0.
 
 `Cargo.lock` is committed and verification uses locked dependencies.
