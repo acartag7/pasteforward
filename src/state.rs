@@ -3,8 +3,12 @@ use crate::error::{Error, Result};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 const MAX_PID_MARKER_BYTES: u64 = 32;
+const STATE_LOCK_ATTEMPTS: usize = 100;
+const STATE_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 struct StateLock {
     _file: File,
@@ -12,10 +16,28 @@ struct StateLock {
 
 fn lock_state() -> Result<StateLock> {
     create_owner_only_dir(&state_dir()?)?;
-    lock_file(&state_dir()?.join("daemon.lock"))
+    lock_file(&state_dir()?.join("daemon.lock"), true)
 }
 
-fn lock_file(path: &Path) -> Result<StateLock> {
+fn lock_state_existing() -> Result<Option<StateLock>> {
+    let path = state_dir()?.join("daemon.lock");
+    match lock_file(&path, false) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn lock_file(path: &Path, create: bool) -> Result<StateLock> {
+    lock_file_with_policy(path, create, STATE_LOCK_ATTEMPTS, STATE_LOCK_RETRY)
+}
+
+fn lock_file_with_policy(
+    path: &Path,
+    create: bool,
+    attempts: usize,
+    retry: Duration,
+) -> Result<StateLock> {
     #[cfg(unix)]
     let file = {
         use std::os::fd::AsRawFd;
@@ -24,7 +46,7 @@ fn lock_file(path: &Path) -> Result<StateLock> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(create)
             .mode(0o600)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
@@ -33,10 +55,29 @@ fn lock_file(path: &Path) -> Result<StateLock> {
                 "daemon state lock is not a regular file".to_string(),
             ));
         }
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+        let mut acquired = false;
+        for attempt in 0..attempts {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                acquired = true;
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            let would_block = error
+                .raw_os_error()
+                .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK);
+            if !would_block {
+                return Err(error.into());
+            }
+            if attempt + 1 < attempts {
+                thread::sleep(retry);
+            }
         }
-        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+        if !acquired {
+            return Err(Error::StateLockTimedOut {
+                milliseconds: retry.as_millis() as u64 * attempts as u64,
+            });
+        }
+        if create && unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         file
@@ -45,7 +86,7 @@ fn lock_file(path: &Path) -> Result<StateLock> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
+        .create(create)
         .open(path)?;
     Ok(StateLock { _file: file })
 }
@@ -63,21 +104,29 @@ fn ready_path() -> Result<PathBuf> {
 }
 
 pub fn write_pid() -> Result<()> {
-    let _lock = lock_state()?;
-    let current_pid = std::process::id();
-    if let Some(pid) = read_pid_marker(&pid_path()?)? {
+    create_owner_only_dir(&state_dir()?)?;
+    write_pid_at(
+        &pid_path()?,
+        &state_dir()?.join("daemon.lock"),
+        std::process::id(),
+    )
+}
+
+fn write_pid_at(path: &Path, lock_path: &Path, current_pid: u32) -> Result<()> {
+    let _lock = lock_file(lock_path, true)?;
+    if let Some(pid) = read_pid_marker(path)? {
         if pid != current_pid && process_alive(pid) {
             return Err(Error::DoctorFailed(format!(
                 "pasteforward daemon is already running with pid {pid}"
             )));
         }
     }
-    write_owner_only_atomic(&pid_path()?, current_pid.to_string().as_bytes())?;
+    write_owner_only_atomic(path, current_pid.to_string().as_bytes())?;
     Ok(())
 }
 
 pub fn read_pid() -> Result<Option<u32>> {
-    let _lock = lock_state()?;
+    let _lock = lock_state_existing()?;
     read_pid_marker(&pid_path()?)
 }
 
@@ -98,24 +147,57 @@ pub fn remove_pid() -> Result<()> {
 }
 
 pub fn read_pid_for_stop() -> Result<Option<u32>> {
-    let _lock = lock_state()?;
-    let pid = read_pid_marker(&pid_path()?)?;
+    create_owner_only_dir(&state_dir()?)?;
+    read_pid_for_stop_at(
+        &pid_path()?,
+        &ready_path()?,
+        &state_dir()?.join("daemon.lock"),
+        || {},
+    )
+}
+
+fn read_pid_for_stop_at(
+    pid_path: &Path,
+    ready_path: &Path,
+    lock_path: &Path,
+    before_cleanup: impl FnOnce(),
+) -> Result<Option<u32>> {
+    let _lock = lock_file(lock_path, true)?;
+    let pid = read_pid_marker(pid_path)?;
+    before_cleanup();
     if pid.is_none() {
-        clear_daemon_ready_unlocked()?;
+        clear_marker_unlocked(ready_path)?;
     }
     Ok(pid)
 }
 
 pub fn clear_stopped_daemon_state(expected_pid: u32) -> Result<()> {
-    let _lock = lock_state()?;
+    create_owner_only_dir(&state_dir()?)?;
+    clear_stopped_daemon_state_at(
+        &pid_path()?,
+        &ready_path()?,
+        &state_dir()?.join("daemon.lock"),
+        expected_pid,
+        || {},
+    )
+}
+
+fn clear_stopped_daemon_state_at(
+    pid_path: &Path,
+    ready_path: &Path,
+    lock_path: &Path,
+    expected_pid: u32,
+    before_ready_unlink: impl FnOnce(),
+) -> Result<()> {
+    let _lock = lock_file(lock_path, true)?;
     let pid_cleanup = (|| -> Result<()> {
-        let path = pid_path()?;
-        if read_pid_marker(&path)? == Some(expected_pid) {
-            fs::remove_file(path)?;
+        if read_pid_marker(pid_path)? == Some(expected_pid) {
+            fs::remove_file(pid_path)?;
         }
         Ok(())
     })();
-    let ready_cleanup = clear_daemon_ready_for_unlocked(Some(expected_pid));
+    let ready_cleanup =
+        clear_marker_for_pid_unlocked(ready_path, Some(expected_pid), before_ready_unlink);
     combine_state_cleanup(pid_cleanup, ready_cleanup)
 }
 
@@ -130,8 +212,17 @@ fn combine_state_cleanup(first: Result<()>, second: Result<()>) -> Result<()> {
 }
 
 pub fn write_daemon_ready() -> Result<()> {
-    let _lock = lock_state()?;
-    write_owner_only_atomic(&ready_path()?, std::process::id().to_string().as_bytes())
+    create_owner_only_dir(&state_dir()?)?;
+    write_daemon_ready_at(
+        &ready_path()?,
+        &state_dir()?.join("daemon.lock"),
+        std::process::id(),
+    )
+}
+
+fn write_daemon_ready_at(path: &Path, lock_path: &Path, pid: u32) -> Result<()> {
+    let _lock = lock_file(lock_path, true)?;
+    write_owner_only_atomic(path, pid.to_string().as_bytes())
 }
 
 pub fn daemon_ready(pid: u32) -> Result<bool> {
@@ -145,7 +236,10 @@ pub fn clear_daemon_ready() -> Result<()> {
 }
 
 fn clear_daemon_ready_unlocked() -> Result<()> {
-    let path = ready_path()?;
+    clear_marker_unlocked(&ready_path()?)
+}
+
+fn clear_marker_unlocked(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -159,12 +253,20 @@ pub fn clear_daemon_ready_for(expected_pid: Option<u32>) -> Result<()> {
 }
 
 fn clear_daemon_ready_for_unlocked(expected_pid: Option<u32>) -> Result<()> {
+    clear_marker_for_pid_unlocked(&ready_path()?, expected_pid, || {})
+}
+
+fn clear_marker_for_pid_unlocked(
+    path: &Path,
+    expected_pid: Option<u32>,
+    before_unlink: impl FnOnce(),
+) -> Result<()> {
     if expected_pid.is_none() {
-        return clear_daemon_ready_unlocked();
+        return clear_marker_unlocked(path);
     }
-    let path = ready_path()?;
-    let ready_pid = read_pid_marker(&path)?;
+    let ready_pid = read_pid_marker(path)?;
     if ready_pid.is_some() && (expected_pid.is_none() || ready_pid == expected_pid) {
+        before_unlink();
         fs::remove_file(path)?;
     }
     Ok(())
@@ -337,10 +439,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let lock_path = root.join("daemon.lock");
-        let first = lock_file(&lock_path).unwrap();
+        let first = lock_file(&lock_path, true).unwrap();
+        assert!(matches!(
+            lock_file_with_policy(&lock_path, false, 2, Duration::from_millis(5)),
+            Err(Error::StateLockTimedOut { .. })
+        ));
         let (sender, receiver) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let _second = lock_file(&lock_path).unwrap();
+            let _second = lock_file(&lock_path, false).unwrap();
             sender.send(()).unwrap();
         });
         assert!(
@@ -353,6 +459,92 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         thread.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_protocol_preserves_publication_across_cleanup_interleavings() {
+        let root = std::env::temp_dir().join(format!(
+            "pasteforward-state-protocol-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_path = root.join("daemon.pid");
+        let ready_path = root.join("daemon.ready");
+        let lock_path = root.join("daemon.lock");
+
+        write_daemon_ready_at(&ready_path, &lock_path, 111).unwrap();
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let cleanup_pid = pid_path.clone();
+        let cleanup_ready = ready_path.clone();
+        let cleanup_lock = lock_path.clone();
+        let cleanup = std::thread::spawn(move || {
+            read_pid_for_stop_at(&cleanup_pid, &cleanup_ready, &cleanup_lock, || {
+                entered_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+            })
+            .unwrap()
+        });
+        entered_receiver.recv().unwrap();
+        let publish_pid = pid_path.clone();
+        let publish_ready = ready_path.clone();
+        let publish_lock = lock_path.clone();
+        let (published_sender, published_receiver) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            write_pid_at(&publish_pid, &publish_lock, 222).unwrap();
+            write_daemon_ready_at(&publish_ready, &publish_lock, 222).unwrap();
+            published_sender.send(()).unwrap();
+        });
+        assert!(
+            published_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        release_sender.send(()).unwrap();
+        assert_eq!(cleanup.join().unwrap(), None);
+        publisher.join().unwrap();
+        assert_eq!(read_pid_marker(&pid_path).unwrap(), Some(222));
+        assert_eq!(read_pid_marker(&ready_path).unwrap(), Some(222));
+
+        std::fs::remove_file(&pid_path).unwrap();
+        write_pid_at(&pid_path, &lock_path, 333).unwrap();
+        write_daemon_ready_at(&ready_path, &lock_path, 333).unwrap();
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let cleanup_pid = pid_path.clone();
+        let cleanup_ready = ready_path.clone();
+        let cleanup_lock = lock_path.clone();
+        let cleanup = std::thread::spawn(move || {
+            clear_stopped_daemon_state_at(&cleanup_pid, &cleanup_ready, &cleanup_lock, 333, || {
+                entered_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+            })
+            .unwrap();
+        });
+        entered_receiver.recv().unwrap();
+        let publish_ready = ready_path.clone();
+        let publish_lock = lock_path.clone();
+        let (published_sender, published_receiver) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            write_daemon_ready_at(&publish_ready, &publish_lock, 444).unwrap();
+            published_sender.send(()).unwrap();
+        });
+        assert!(
+            published_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        release_sender.send(()).unwrap();
+        cleanup.join().unwrap();
+        publisher.join().unwrap();
+        assert_eq!(read_pid_marker(&ready_path).unwrap(), Some(444));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

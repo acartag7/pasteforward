@@ -20,6 +20,9 @@ pub enum Error {
         program: String,
         seconds: u64,
     },
+    StateLockTimedOut {
+        milliseconds: u64,
+    },
     LimitExceeded(String),
     DoctorFailed(String),
 }
@@ -55,6 +58,9 @@ impl Display for Error {
             }
             Error::CommandTimedOut { program, seconds } => {
                 write!(f, "command timed out after {seconds}s: {program}")
+            }
+            Error::StateLockTimedOut { milliseconds } => {
+                write!(f, "daemon state lock timed out after {milliseconds}ms")
             }
             Error::LimitExceeded(message) => write!(f, "{message}"),
             Error::DoctorFailed(message) => write!(f, "{message}"),

@@ -42,6 +42,9 @@ expect_failure env PASTEFORWARD_CONFIG_HOME="$config" PASTEFORWARD_STATE_HOME="$
 
 sed 's/"version": 2/"version": 1/' "$config/config.json" >"$config/root-path.json"
 mv "$config/root-path.json" "$config/config.json"
+env PASTEFORWARD_CONFIG_HOME="$config" PASTEFORWARD_STATE_HOME="$state" \
+  "$BIN" status >"$tmp/stdout" 2>"$tmp/stderr"
+test ! -e "$state"
 for remote_dir in / // /// /tmp//pasteforward /tmp/./pasteforward /tmp/../pasteforward /tmp/pasteforward/; do
   sed "s#\"remote_dir\": \"/tmp/pasteforward\"#\"remote_dir\": \"$remote_dir\"#" \
     "$config/config.json" >"$config/root-path.json"
