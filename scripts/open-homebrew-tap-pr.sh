@@ -47,7 +47,10 @@ ensure_tap_pr() {
 
 gh repo clone "$TAP_REPO" "$tmp/tap" -- --depth=1
 cd "$tmp/tap"
-if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+branch_exists=false
+remote_branch="$(git ls-remote --heads origin "$BRANCH")"
+if [ -n "$remote_branch" ]; then
+  branch_exists=true
   git fetch origin "$BRANCH"
   git checkout -B "$BRANCH" FETCH_HEAD
 else
@@ -58,7 +61,9 @@ install -m 0644 "$FORMULA" Formula/pasteforward.rb
 
 if git diff --quiet -- Formula/pasteforward.rb; then
   echo "tap formula already matches $TAG"
-  ensure_tap_pr
+  if [ "$branch_exists" = true ]; then
+    ensure_tap_pr
+  fi
   exit 0
 fi
 
