@@ -13,6 +13,38 @@ BRANCH="chore/pasteforward-${TAG}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+ensure_tap_pr() {
+  state="$(gh pr list \
+    --repo "$TAP_REPO" \
+    --head "$BRANCH" \
+    --state all \
+    --json state \
+    --jq '.[0].state // ""')"
+  case "$state" in
+    OPEN)
+      echo "tap pull request already exists for $TAG"
+      ;;
+    CLOSED)
+      gh pr reopen "$BRANCH" --repo "$TAP_REPO"
+      ;;
+    MERGED)
+      echo "tap pull request for $TAG is already merged"
+      ;;
+    '')
+      gh pr create \
+        --repo "$TAP_REPO" \
+        --base main \
+        --head "$BRANCH" \
+        --title "chore: update PasteForward to $TAG" \
+        --body "Update the checksum-pinned PasteForward formula for $TAG. The source release remains draft until this PR is reviewed and merged."
+      ;;
+    *)
+      echo "unexpected tap pull request state: $state" >&2
+      exit 1
+      ;;
+  esac
+}
+
 gh repo clone "$TAP_REPO" "$tmp/tap" -- --depth=1
 cd "$tmp/tap"
 if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
@@ -26,6 +58,7 @@ install -m 0644 "$FORMULA" Formula/pasteforward.rb
 
 if git diff --quiet -- Formula/pasteforward.rb; then
   echo "tap formula already matches $TAG"
+  ensure_tap_pr
   exit 0
 fi
 
@@ -34,13 +67,4 @@ git config user.email "release-automation@users.noreply.github.com"
 git add Formula/pasteforward.rb
 git commit -m "chore: update PasteForward to $TAG"
 git push --set-upstream origin "$BRANCH"
-if gh pr view "$BRANCH" --repo "$TAP_REPO" >/dev/null 2>&1; then
-  echo "tap pull request already exists for $TAG"
-  exit 0
-fi
-gh pr create \
-  --repo "$TAP_REPO" \
-  --base main \
-  --head "$BRANCH" \
-  --title "chore: update PasteForward to $TAG" \
-  --body "Update the checksum-pinned PasteForward formula for $TAG. The source release remains draft until this PR is reviewed and merged."
+ensure_tap_pr

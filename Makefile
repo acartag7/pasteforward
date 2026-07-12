@@ -17,6 +17,7 @@ lint:
 
 integration: build
 	sh scripts/test-cli-boundaries.sh
+	sh scripts/test-open-homebrew-tap-pr.sh
 
 supply-chain:
 	sh scripts/check-supply-chain.sh
