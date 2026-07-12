@@ -55,28 +55,68 @@ pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
     );
     let previous = read_existing_service_file(plist)?;
     let was_running = service_running();
+    let manual_daemon_was_running = recorded_daemon_running()? && !was_running;
     write_owner_only_atomic(plist, content.as_bytes())?;
-    let result = (|| -> Result<()> {
-        if was_running {
-            run(
-                "launchctl",
-                &["bootout".to_string(), format!("gui/{uid}/{label}")],
-                None,
-            )?;
-        }
-        stop_recorded_daemon()?;
-        bootstrap_launch_agent(plist, uid)
-    })();
+    let result = activate_launch_agent(
+        was_running,
+        || bootout_launch_agent(label, uid),
+        stop_recorded_daemon,
+        || bootstrap_launch_agent(plist, uid),
+        wait_for_recorded_daemon_ready,
+    );
     if let Err(error) = result {
-        return rollback_service_file(plist, previous.as_deref(), error, || {
+        if launch_agent_loaded(label, uid) {
+            let _ = bootout_launch_agent(label, uid);
+        }
+        let rollback = rollback_service_file(plist, previous.as_deref(), error, || {
             if was_running && previous.is_some() {
-                bootstrap_launch_agent(plist, uid)
+                bootstrap_launch_agent(plist, uid)?;
+                wait_for_recorded_daemon_ready()
             } else {
                 Ok(())
             }
         });
+        return complete_service_rollback(
+            rollback,
+            manual_daemon_was_running,
+            recorded_daemon_running,
+            || start_manual_daemon(&exe),
+        );
     }
     Ok(())
+}
+
+fn activate_launch_agent(
+    was_running: bool,
+    bootout_previous: impl FnOnce() -> Result<()>,
+    stop_daemon: impl FnOnce() -> Result<()>,
+    bootstrap_candidate: impl FnOnce() -> Result<()>,
+    wait_until_ready: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if was_running {
+        bootout_previous()?;
+    }
+    stop_daemon()?;
+    bootstrap_candidate()?;
+    wait_until_ready()
+}
+
+fn bootout_launch_agent(label: &str, uid: u32) -> Result<()> {
+    run(
+        "launchctl",
+        &["bootout".to_string(), format!("gui/{uid}/{label}")],
+        None,
+    )?;
+    Ok(())
+}
+
+fn launch_agent_loaded(label: &str, uid: u32) -> bool {
+    run(
+        "launchctl",
+        &["print".to_string(), format!("gui/{uid}/{label}")],
+        None,
+    )
+    .is_ok()
 }
 
 fn bootstrap_launch_agent(plist: &Path, uid: u32) -> Result<()> {
@@ -125,7 +165,7 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
             previous_state,
             systemctl,
         );
-        return complete_systemd_rollback(
+        return complete_service_rollback(
             rollback,
             manual_daemon_was_running,
             recorded_daemon_running,
@@ -143,7 +183,7 @@ fn manual_daemon_is_independent(
         && previous_state.is_none_or(|state| state.activity != SystemdActivity::Active)
 }
 
-fn complete_systemd_rollback(
+fn complete_service_rollback(
     rollback: Result<()>,
     manual_daemon_was_running: bool,
     check_manual_daemon: impl FnOnce() -> Result<bool>,
@@ -470,6 +510,44 @@ mod tests {
     }
 
     #[test]
+    fn launch_agent_activation_waits_for_readiness_after_daemon_handoff() {
+        use std::cell::RefCell;
+
+        let trace = RefCell::new(Vec::new());
+        let result = activate_launch_agent(
+            true,
+            || {
+                trace.borrow_mut().push("bootout-previous");
+                Ok(())
+            },
+            || {
+                trace.borrow_mut().push("stop-recorded-daemon");
+                Ok(())
+            },
+            || {
+                trace.borrow_mut().push("bootstrap-candidate");
+                Ok(())
+            },
+            || {
+                trace.borrow_mut().push("wait-until-ready");
+                Err(Error::DoctorFailed(
+                    "injected readiness failure".to_string(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            trace.into_inner(),
+            vec![
+                "bootout-previous",
+                "stop-recorded-daemon",
+                "bootstrap-candidate",
+                "wait-until-ready"
+            ]
+        );
+    }
+
+    #[test]
     fn systemd_activation_propagates_every_handoff_failure() {
         use std::cell::{Cell, RefCell};
 
@@ -581,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_daemon_state_is_restored_after_systemd_rollback() {
+    fn manual_daemon_state_is_restored_after_service_rollback() {
         use std::cell::Cell;
 
         let inactive = SystemdState {
@@ -598,7 +676,7 @@ mod tests {
         assert!(!manual_daemon_is_independent(false, None));
 
         let restarted = Cell::new(false);
-        let result = complete_systemd_rollback(
+        let result = complete_service_rollback(
             Err(Error::DoctorFailed("activation failed".to_string())),
             true,
             || Ok(false),
@@ -612,7 +690,7 @@ mod tests {
             matches!(result, Err(Error::DoctorFailed(message)) if message == "activation failed")
         );
 
-        let result = complete_systemd_rollback(
+        let result = complete_service_rollback(
             Err(Error::DoctorFailed("activation failed".to_string())),
             true,
             || Ok(false),

@@ -37,8 +37,14 @@ fn run_with_timeout(
     if input.is_some() {
         cmd.stdin(Stdio::piped());
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd.spawn()?;
+    let child_pid = child.id();
     let stdout = child
         .stdout
         .take()
@@ -59,18 +65,34 @@ fn run_with_timeout(
     });
 
     let started = Instant::now();
+    let mut child_status = None;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        if child_status.is_none() {
+            child_status = child.try_wait()?;
+        }
+        let output_complete = stdout_reader.is_finished() && stderr_reader.is_finished();
+        let input_complete = stdin_writer
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished);
+        if output_complete && input_complete {
+            if let Some(status) = child_status {
+                break status;
+            }
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
+            kill_child_tree(&mut child, child_pid);
             let _ = child.wait();
             if let Some(writer) = stdin_writer.take() {
-                let _ = writer.join();
+                if writer.is_finished() {
+                    let _ = writer.join();
+                }
             }
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            if stdout_reader.is_finished() {
+                let _ = stdout_reader.join();
+            }
+            if stderr_reader.is_finished() {
+                let _ = stderr_reader.join();
+            }
             return Err(Error::CommandTimedOut {
                 program: program.to_string(),
                 seconds: timeout.as_secs(),
@@ -113,6 +135,14 @@ fn run_with_timeout(
     }
 
     Ok(CommandOutput { stdout })
+}
+
+fn kill_child_tree(child: &mut std::process::Child, child_pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child_pid as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
 }
 
 fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
@@ -203,5 +233,19 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(matches!(result, Err(Error::CommandTimedOut { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_applies_to_descendants_holding_output_pipes() {
+        let started = Instant::now();
+        let result = run_with_timeout(
+            "sh",
+            &["-c".to_string(), "sleep 5 &".to_string()],
+            None,
+            Duration::from_millis(100),
+        );
+        assert!(matches!(result, Err(Error::CommandTimedOut { .. })));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

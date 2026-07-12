@@ -136,7 +136,7 @@ reload are both attempted on every rollback path. An independently running
 manual daemon that was stopped for the handoff is restarted if activation fails.
 Restoration reports success only after the daemon publishes a PID-bound ready
 marker following local-backend and config initialization and remains healthy for
-a bounded stability window; platform-service activation uses the same readiness
+a bounded stability window; launchd and systemd activation use the same readiness
 bar. Failed or timed-out manual starts are terminated and reaped.
 
 `install-service` and `uninstall-service` change only the local user service.

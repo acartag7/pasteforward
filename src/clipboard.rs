@@ -171,8 +171,11 @@ fn read_macos_image() -> Result<Option<Vec<u8>>> {
         "close access fp".to_string(),
     ];
 
-    if run("osascript", &args, None).is_err() {
-        return Ok(None);
+    if let Err(error) = run("osascript", &args, None) {
+        return match error {
+            Error::LimitExceeded(_) => Err(error),
+            _ => Ok(None),
+        };
     }
 
     let size = fs::metadata(&path)?.len();
@@ -201,9 +204,17 @@ impl Drop for RemoveFile {
 
 fn read_wayland_image() -> Result<Option<Vec<u8>>> {
     let args = vec!["--type".to_string(), "image/png".to_string()];
-    match run("wl-paste", &args, None) {
+    linux_clipboard_result(run("wl-paste", &args, None))
+}
+
+fn linux_clipboard_result(
+    result: Result<crate::command::CommandOutput>,
+) -> Result<Option<Vec<u8>>> {
+    match result {
         Ok(output) if !output.stdout.is_empty() => Ok(Some(output.stdout)),
-        _ => Ok(None),
+        Ok(_) => Ok(None),
+        Err(error @ Error::LimitExceeded(_)) => Err(error),
+        Err(_) => Ok(None),
     }
 }
 
@@ -215,10 +226,7 @@ fn read_x11_image() -> Result<Option<Vec<u8>>> {
         "image/png".to_string(),
         "-o".to_string(),
     ];
-    match run("xclip", &args, None) {
-        Ok(output) if !output.stdout.is_empty() => Ok(Some(output.stdout)),
-        _ => Ok(None),
-    }
+    linux_clipboard_result(run("xclip", &args, None))
 }
 
 #[cfg(test)]
@@ -245,5 +253,18 @@ mod tests {
         );
         assert!(x11_socket_path("example.test:0").is_none());
         assert!(x11_socket_path(":bad").is_none());
+    }
+
+    #[test]
+    fn linux_clipboard_propagates_output_limit_errors() {
+        let result = linux_clipboard_result(Err(Error::LimitExceeded("oversized".to_string())));
+        assert!(matches!(result, Err(Error::LimitExceeded(_))));
+        let result = linux_clipboard_result(Err(Error::CommandFailed {
+            program: "xclip".to_string(),
+            args: Vec::new(),
+            code: Some(1),
+            stderr: String::new(),
+        }));
+        assert!(matches!(result, Ok(None)));
     }
 }

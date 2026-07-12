@@ -57,18 +57,21 @@ Release build inputs are pinned:
 - Remote cache paths must be canonical non-root absolute paths. Repeated
   separators, trailing separators, and `.` or `..` segments are rejected.
 - Exported sync functions repeat complete config and destination validation.
-- Child processes have fixed wall-clock timeouts and captured-output caps.
+- Child processes run in dedicated process groups with fixed wall-clock
+  timeouts and captured-output caps; descendants cannot extend a command by
+  retaining inherited pipes after the direct child exits.
 - Clipboard images and SSH clipboard readback have fixed byte caps.
 - Setup and doctor failures return non-zero. Failure is never reported as a
   successful partial initialization.
 - Config reads use `O_NOFOLLOW`; config and service files use owner-only atomic
   replacement; newly created directory components are mode `0700`.
 - Daemon PID/readiness markers are owner-only, no-follow regular files with a
-  32-byte read cap; symlinks, FIFOs, devices, malformed values, and oversize
-  markers are rejected without blocking service activation. PID and readiness
-  publication/cleanup are serialized by an owner-only no-follow process lock
-  with a one-second acquisition deadline. Observational status reads never
-  create the state directory or lock.
+  32-byte read cap; symlinks, FIFOs, devices, and oversize markers are rejected
+  without blocking service activation. Observational reads reject malformed
+  values; serialized mutation paths remove and replace them as stale state. PID
+  and readiness publication/cleanup are serialized by an owner-only no-follow
+  process lock with a one-second acquisition deadline. Observational status
+  reads never create the state directory or lock.
 
 ## Remote Command Allowlist
 

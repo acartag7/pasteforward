@@ -174,7 +174,7 @@ pub fn write_pid() -> Result<()> {
 
 fn write_pid_at(path: &Path, lock_path: &Path, current_pid: u32) -> Result<()> {
     let _lock = lock_file(lock_path, true)?;
-    if let Some(pid) = read_pid_marker(path)? {
+    if let Some(pid) = read_pid_marker_for_mutation(path)? {
         if pid != current_pid && process_alive(pid) {
             return Err(Error::DoctorFailed(format!(
                 "pasteforward daemon is already running with pid {pid}"
@@ -195,7 +195,7 @@ pub fn remove_pid() -> Result<()> {
     let current_pid = std::process::id();
     let pid_cleanup = (|| -> Result<()> {
         let path = pid_path()?;
-        if let Some(recorded_pid) = read_pid_marker(&path)? {
+        if let Some(recorded_pid) = read_pid_marker_for_mutation(&path)? {
             if recorded_pid == current_pid {
                 fs::remove_file(path)?;
             }
@@ -223,7 +223,7 @@ fn read_pid_for_stop_at(
     before_cleanup: impl FnOnce(),
 ) -> Result<Option<u32>> {
     let _lock = lock_file(lock_path, true)?;
-    let pid = read_pid_marker(pid_path)?;
+    let pid = read_pid_marker_for_mutation(pid_path)?;
     before_cleanup();
     if pid.is_none() {
         clear_marker_unlocked(ready_path)?;
@@ -251,7 +251,7 @@ fn clear_stopped_daemon_state_at(
 ) -> Result<()> {
     let _lock = lock_file(lock_path, true)?;
     let pid_cleanup = (|| -> Result<()> {
-        if read_pid_marker(pid_path)? == Some(expected_pid) {
+        if read_pid_marker_for_mutation(pid_path)? == Some(expected_pid) {
             fs::remove_file(pid_path)?;
         }
         Ok(())
@@ -287,7 +287,7 @@ fn write_daemon_ready_at(path: &Path, lock_path: &Path, pid: u32) -> Result<()> 
 
 pub fn daemon_ready(pid: u32) -> Result<bool> {
     let _lock = lock_state()?;
-    Ok(read_pid_marker(&ready_path()?)? == Some(pid))
+    Ok(read_pid_marker_for_mutation(&ready_path()?)? == Some(pid))
 }
 
 pub fn clear_daemon_ready() -> Result<()> {
@@ -324,7 +324,7 @@ fn clear_marker_for_pid_unlocked(
     if expected_pid.is_none() {
         return clear_marker_unlocked(path);
     }
-    let ready_pid = read_pid_marker(path)?;
+    let ready_pid = read_pid_marker_for_mutation(path)?;
     if ready_pid.is_some() && (expected_pid.is_none() || ready_pid == expected_pid) {
         before_unlink();
         fs::remove_file(path)?;
@@ -357,8 +357,18 @@ fn read_pid_marker(path: &Path) -> Result<Option<u32>> {
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|pid| *pid != 0)
-        .ok_or_else(|| Error::DoctorFailed("daemon state marker is malformed".to_string()))?;
+        .ok_or(Error::MalformedDaemonMarker)?;
     Ok(Some(value))
+}
+
+fn read_pid_marker_for_mutation(path: &Path) -> Result<Option<u32>> {
+    match read_pid_marker(path) {
+        Err(Error::MalformedDaemonMarker) => {
+            clear_marker_unlocked(path)?;
+            Ok(None)
+        }
+        result => result,
+    }
 }
 
 pub fn process_alive(pid: u32) -> bool {
@@ -483,6 +493,31 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
         assert!(read_pid_marker(&fifo).is_err());
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_paths_recover_malformed_markers_as_stale() {
+        let root = std::env::temp_dir().join(format!(
+            "pasteforward-malformed-marker-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_path = root.join("daemon.pid");
+        let ready_path = root.join("daemon.ready");
+        let lock_path = root.join("daemon.lock");
+        std::fs::write(&pid_path, b"truncated").unwrap();
+        write_pid_at(&pid_path, &lock_path, 123).unwrap();
+        assert_eq!(read_pid_marker(&pid_path).unwrap(), Some(123));
+
+        std::fs::write(&ready_path, b"not-a-pid").unwrap();
+        assert_eq!(read_pid_marker_for_mutation(&ready_path).unwrap(), None);
+        assert!(!ready_path.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

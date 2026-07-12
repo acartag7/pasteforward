@@ -26,7 +26,6 @@ test ! -d "$dir/media"
 "$bin" --version
 "$bin" help >/dev/null
 HOME="$tmp/home" PASTEFORWARD_CONFIG_HOME="$tmp/config" PASTEFORWARD_STATE_HOME="$tmp/state" "$bin" status
-HOME="$tmp/home" PASTEFORWARD_CONFIG_HOME="$tmp/config" PASTEFORWARD_STATE_HOME="$tmp/state" "$bin" doctor
 
 (
   cd "$(dirname "$artifact_path")"

@@ -23,6 +23,7 @@ pub enum Error {
     StateLockTimedOut {
         milliseconds: u64,
     },
+    MalformedDaemonMarker,
     LimitExceeded(String),
     DoctorFailed(String),
 }
@@ -62,6 +63,7 @@ impl Display for Error {
             Error::StateLockTimedOut { milliseconds } => {
                 write!(f, "daemon state lock timed out after {milliseconds}ms")
             }
+            Error::MalformedDaemonMarker => write!(f, "daemon state marker is malformed"),
             Error::LimitExceeded(message) => write!(f, "{message}"),
             Error::DoctorFailed(message) => write!(f, "{message}"),
         }
