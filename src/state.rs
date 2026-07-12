@@ -370,7 +370,26 @@ fn read_pid_marker_for_mutation(path: &Path) -> Result<Option<u32>> {
             clear_marker_unlocked(path)?;
             Ok(None)
         }
+        Err(error) => {
+            if clear_non_regular_marker_for_mutation(path)? {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
         result => result,
+    }
+}
+
+fn clear_non_regular_marker_for_mutation(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => {
+            clear_marker_unlocked(path)?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -549,6 +568,57 @@ mod tests {
         );
         assert!(!pid_path.exists());
         assert!(!ready_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_paths_clear_non_regular_markers_as_stale() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::UnixListener;
+
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/pf-untrusted-marker-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_path = root.join("daemon.pid");
+        let ready_path = root.join("daemon.ready");
+        let lock_path = root.join("daemon.lock");
+        let target = root.join("target");
+        std::fs::write(&target, b"unrelated").unwrap();
+
+        std::os::unix::fs::symlink(&target, &pid_path).unwrap();
+        write_pid_at(&pid_path, &ready_path, &lock_path, 123).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated");
+        assert_eq!(read_pid_marker(&pid_path).unwrap(), Some(123));
+
+        std::fs::remove_file(&pid_path).unwrap();
+        let fifo_path = CString::new(pid_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        std::fs::write(&ready_path, b"123").unwrap();
+        assert_eq!(
+            read_pid_for_stop_at(&pid_path, &ready_path, &lock_path, || {}).unwrap(),
+            None
+        );
+        assert!(!pid_path.exists());
+        assert!(!ready_path.exists());
+
+        let listener = UnixListener::bind(&pid_path).unwrap();
+        drop(listener);
+        std::fs::write(&ready_path, b"456").unwrap();
+        clear_stopped_daemon_state_at(&pid_path, &ready_path, &lock_path, 456, || {}).unwrap();
+        assert!(!pid_path.exists());
+        assert!(!ready_path.exists());
+
+        std::fs::create_dir(&pid_path).unwrap();
+        assert!(read_pid_marker_for_mutation(&pid_path).is_err());
+        assert!(pid_path.is_dir());
         std::fs::remove_dir_all(root).unwrap();
     }
 
