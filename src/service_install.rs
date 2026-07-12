@@ -29,6 +29,12 @@ struct SystemdState {
     activity: SystemdActivity,
 }
 
+#[derive(Debug)]
+struct LaunchActivationFailure {
+    error: Error,
+    candidate_loaded: bool,
+}
+
 pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
     if let Some(parent) = plist.parent() {
         create_owner_only_dir(parent)?;
@@ -64,11 +70,13 @@ pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
         || bootstrap_launch_agent(plist, uid),
         wait_for_recorded_daemon_ready,
     );
-    if let Err(error) = result {
-        if launch_agent_loaded(label, uid) {
-            let _ = bootout_launch_agent(label, uid);
-        }
-        let rollback = rollback_service_file(plist, previous.as_deref(), error, || {
+    if let Err(failure) = result {
+        let candidate_cleanup = if failure.candidate_loaded {
+            bootout_launch_agent(label, uid)
+        } else {
+            Ok(())
+        };
+        let rollback = rollback_service_file(plist, previous.as_deref(), failure.error, || {
             if was_running && previous.is_some() {
                 bootstrap_launch_agent(plist, uid)?;
                 wait_for_recorded_daemon_ready()
@@ -76,6 +84,7 @@ pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
                 Ok(())
             }
         });
+        let rollback = combine_candidate_cleanup(candidate_cleanup, rollback);
         return complete_service_rollback(
             rollback,
             manual_daemon_was_running,
@@ -92,13 +101,25 @@ fn activate_launch_agent(
     stop_daemon: impl FnOnce() -> Result<()>,
     bootstrap_candidate: impl FnOnce() -> Result<()>,
     wait_until_ready: impl FnOnce() -> Result<()>,
-) -> Result<()> {
+) -> std::result::Result<(), LaunchActivationFailure> {
     if was_running {
-        bootout_previous()?;
+        bootout_previous().map_err(|error| LaunchActivationFailure {
+            error,
+            candidate_loaded: false,
+        })?;
     }
-    stop_daemon()?;
-    bootstrap_candidate()?;
-    wait_until_ready()
+    stop_daemon().map_err(|error| LaunchActivationFailure {
+        error,
+        candidate_loaded: false,
+    })?;
+    bootstrap_candidate().map_err(|error| LaunchActivationFailure {
+        error,
+        candidate_loaded: false,
+    })?;
+    wait_until_ready().map_err(|error| LaunchActivationFailure {
+        error,
+        candidate_loaded: true,
+    })
 }
 
 fn bootout_launch_agent(label: &str, uid: u32) -> Result<()> {
@@ -108,15 +129,6 @@ fn bootout_launch_agent(label: &str, uid: u32) -> Result<()> {
         None,
     )?;
     Ok(())
-}
-
-fn launch_agent_loaded(label: &str, uid: u32) -> bool {
-    run(
-        "launchctl",
-        &["print".to_string(), format!("gui/{uid}/{label}")],
-        None,
-    )
-    .is_ok()
 }
 
 fn bootstrap_launch_agent(plist: &Path, uid: u32) -> Result<()> {
@@ -130,6 +142,16 @@ fn bootstrap_launch_agent(plist: &Path, uid: u32) -> Result<()> {
         None,
     )?;
     Ok(())
+}
+
+fn combine_candidate_cleanup(candidate_cleanup: Result<()>, rollback: Result<()>) -> Result<()> {
+    match (candidate_cleanup, rollback) {
+        (Ok(()), rollback) => rollback,
+        (Err(cleanup), Ok(())) => Err(cleanup),
+        (Err(cleanup), Err(rollback)) => Err(Error::DoctorFailed(format!(
+            "candidate service cleanup failed ({cleanup}) and service rollback failed ({rollback})"
+        ))),
+    }
 }
 
 pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
@@ -535,7 +557,8 @@ mod tests {
                 ))
             },
         );
-        assert!(result.is_err());
+        let failure = result.unwrap_err();
+        assert!(failure.candidate_loaded);
         assert_eq!(
             trace.into_inner(),
             vec![
@@ -545,6 +568,48 @@ mod tests {
                 "wait-until-ready"
             ]
         );
+    }
+
+    #[test]
+    fn launch_agent_rollback_retains_cleanup_and_restores_prior_states() {
+        use std::cell::Cell;
+
+        let root = test_dir("launch-rollback");
+        create_owner_only_dir(&root).unwrap();
+        let path = root.join("service");
+        write_owner_only_atomic(&path, b"candidate").unwrap();
+        let prior_agent_restored = Cell::new(false);
+        let service_rollback = rollback_service_file(
+            &path,
+            Some(b"previous"),
+            Error::DoctorFailed("activation failed".to_string()),
+            || {
+                prior_agent_restored.set(true);
+                Ok(())
+            },
+        );
+        let rollback = combine_candidate_cleanup(
+            Err(Error::DoctorFailed("candidate bootout failed".to_string())),
+            service_rollback,
+        );
+        let manual_daemon_restored = Cell::new(false);
+        let result = complete_service_rollback(
+            rollback,
+            false,
+            || Ok(false),
+            || {
+                manual_daemon_restored.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(prior_agent_restored.get());
+        assert!(!manual_daemon_restored.get());
+        assert_eq!(fs::read(&path).unwrap(), b"previous");
+        assert!(
+            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("candidate service cleanup failed"))
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
