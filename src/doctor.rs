@@ -1,7 +1,9 @@
 use crate::clipboard::detect_local_backend;
-use crate::command::{javascript_string, shell_quote, ssh};
+use crate::command::{shell_quote, ssh};
 use crate::config::{AppConfig, DestinationConfig, RemoteMode};
-use crate::error::{Error, Result};
+use crate::error::Result;
+use crate::remote::{remote_clipboard_probe_command, resolve_remote_mode};
+use crate::validation::{validate_config, validate_destination};
 
 #[derive(Debug, Clone)]
 pub struct DestinationDoctor {
@@ -42,6 +44,11 @@ pub fn doctor_destination(
         problems: Vec::new(),
     };
 
+    if let Err(err) = validate_config(config).and_then(|()| validate_destination(name, dest)) {
+        result.problems.push(format!("invalid config: {err}"));
+        return result;
+    }
+
     if !dest.enabled {
         result.problems.push("destination is disabled".to_string());
     }
@@ -58,17 +65,27 @@ pub fn doctor_destination(
         Ok(mode) => {
             result.remote_mode = Some(mode.clone());
             result.remote_clipboard_ok = check_remote_clipboard(dest, &mode);
+            if !result.remote_clipboard_ok {
+                let detail = match mode {
+                    RemoteMode::LinuxWayland => {
+                        "remote Wayland clipboard is unavailable; set WAYLAND_DISPLAY and XDG_RUNTIME_DIR and ensure wl-clipboard is installed"
+                    }
+                    RemoteMode::LinuxX11 => {
+                        "remote X11 clipboard is unavailable; set DISPLAY and ensure xclip is installed"
+                    }
+                    RemoteMode::MacosPasteboard => {
+                        "remote macOS pasteboard is unavailable in this SSH login session"
+                    }
+                    RemoteMode::Auto => "remote clipboard is unavailable",
+                };
+                result.problems.push(detail.to_string());
+            }
         }
         Err(err) => result.problems.push(err.to_string()),
     }
 
     let remote_dir = config.destination_remote_dir(dest);
-    let dir_cmd = format!(
-        "umask 077 && mkdir -p {} && chmod 700 {} && test -w {}",
-        shell_quote(&remote_dir),
-        shell_quote(&remote_dir),
-        shell_quote(&remote_dir)
-    );
+    let dir_cmd = remote_dir_probe_command(&remote_dir);
     match ssh(&dest.host, &dir_cmd, None) {
         Ok(_) => result.remote_dir_ok = true,
         Err(err) => result.problems.push(format!("remote dir failed: {err}")),
@@ -77,117 +94,31 @@ pub fn doctor_destination(
     result
 }
 
-pub fn resolve_remote_mode(dest: &DestinationConfig) -> Result<RemoteMode> {
-    if dest.remote_mode != RemoteMode::Auto {
-        return Ok(dest.remote_mode.clone());
-    }
-
-    let script = r#"uname_s="$(uname -s 2>/dev/null || true)"
-if [ "$uname_s" = "Darwin" ]; then
-  printf macos-pasteboard
-elif command -v wl-copy >/dev/null 2>&1; then
-  printf linux-wayland
-elif command -v xclip >/dev/null 2>&1; then
-  printf linux-x11
-else
-  printf unsupported
-fi"#;
-
-    let output = ssh(&dest.host, script, None)?;
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    RemoteMode::parse(&value).map_err(|_| {
-        Error::DoctorFailed(format!(
-            "remote clipboard backend not found on {}; install wl-clipboard or xclip for Linux GUI remotes",
-            dest.host
-        ))
-    })
-}
-
-pub fn sync_remote_image_command(
-    config: &AppConfig,
-    dest: &DestinationConfig,
-    remote_mode: &RemoteMode,
-    remote_path: &str,
-) -> Result<String> {
+pub fn prepare_remote_directory(config: &AppConfig, dest: &DestinationConfig) -> Result<()> {
+    validate_config(config)?;
+    validate_destination("remote", dest)?;
     let remote_dir = config.destination_remote_dir(dest);
-    Ok([
-        "umask 077".to_string(),
-        format!("mkdir -p {}", shell_quote(&remote_dir)),
-        format!("chmod 700 {}", shell_quote(&remote_dir)),
-        format!("cat > {}", shell_quote(remote_path)),
-        set_clipboard_command(dest, remote_mode, remote_path)?,
-    ]
-    .join(" && "))
+    let command = format!(
+        "umask 077 && mkdir -p {} && chmod 700 {} && test -w {}",
+        shell_quote(&remote_dir),
+        shell_quote(&remote_dir),
+        shell_quote(&remote_dir)
+    );
+    ssh(&dest.host, &command, None)?;
+    Ok(())
 }
 
-pub fn set_clipboard_command(
-    dest: &DestinationConfig,
-    remote_mode: &RemoteMode,
-    remote_path: &str,
-) -> Result<String> {
-    let env_prefix = remote_env_prefix(dest);
-    match remote_mode {
-        RemoteMode::MacosPasteboard => {
-            let script = format!(
-                concat!(
-                    "ObjC.import(\"AppKit\");",
-                    "ObjC.import(\"Foundation\");",
-                    "const path = {};",
-                    "const png = $.NSData.dataWithContentsOfFile(path);",
-                    "if (!png) throw new Error(\"failed to read png\");",
-                    "const image = $.NSImage.alloc.initWithData(png);",
-                    "if (!image) throw new Error(\"failed to load image\");",
-                    "const item = $.NSPasteboardItem.alloc.init;",
-                    "const url = $.NSURL.fileURLWithPath(path);",
-                    "item.setStringForType(url.absoluteString, \"public.file-url\");",
-                    "item.setDataForType(png, \"public.png\");",
-                    "const tiff = image.TIFFRepresentation;",
-                    "if (tiff && tiff.length > 0) item.setDataForType(tiff, \"public.tiff\");",
-                    "const objects = $.NSMutableArray.arrayWithCapacity(1);",
-                    "objects.addObject(item);",
-                    "const pasteboard = $.NSPasteboard.generalPasteboard;",
-                    "pasteboard.clearContents;",
-                    "if (!pasteboard.writeObjects(objects)) throw new Error(\"failed to write pasteboard\");"
-                ),
-                javascript_string(remote_path)
-            );
-            Ok(format!(
-                "/usr/bin/osascript -l JavaScript -e {}",
-                shell_quote(&script)
-            ))
-        }
-        RemoteMode::LinuxWayland => Ok(format!(
-            "({}wl-copy --type image/png < {} >/dev/null 2>&1 & sleep 0.2)",
-            env_prefix,
-            shell_quote(remote_path)
-        )),
-        RemoteMode::LinuxX11 => Ok(format!(
-            "({}xclip -selection clipboard -t image/png -i {} >/dev/null 2>&1 & sleep 0.2)",
-            env_prefix,
-            shell_quote(remote_path)
-        )),
-        RemoteMode::Auto => Err(Error::DoctorFailed(
-            "remote mode must be resolved before sync".to_string(),
-        )),
-    }
-}
-
-pub fn clear_clipboard_command(
-    dest: &DestinationConfig,
-    remote_mode: &RemoteMode,
-) -> Result<String> {
-    let env_prefix = remote_env_prefix(dest);
-    match remote_mode {
-        RemoteMode::MacosPasteboard => Ok("printf '' | /usr/bin/pbcopy".to_string()),
-        RemoteMode::LinuxWayland => Ok(format!("printf '' | {}wl-copy", env_prefix)),
-        RemoteMode::LinuxX11 => Ok(format!(
-            "printf '' | {}xclip -selection clipboard",
-            env_prefix
-        )),
-        RemoteMode::Auto => Err(Error::DoctorFailed(
-            "remote mode must be resolved before clear".to_string(),
-        )),
-    }
+fn remote_dir_probe_command(remote_dir: &str) -> String {
+    format!(
+        concat!(
+            "probe={}; ",
+            "while ! test -e \"$probe\"; do ",
+            "parent=\"${{probe%/*}}\"; ",
+            "if test -z \"$parent\"; then probe=/; else probe=\"$parent\"; fi; ",
+            "done; test -d \"$probe\" && test -w \"$probe\""
+        ),
+        shell_quote(remote_dir)
+    )
 }
 
 pub fn local_doctor_problem() -> Option<String> {
@@ -195,70 +126,9 @@ pub fn local_doctor_problem() -> Option<String> {
 }
 
 fn check_remote_clipboard(dest: &DestinationConfig, remote_mode: &RemoteMode) -> bool {
-    let command = match remote_mode {
-        RemoteMode::MacosPasteboard => {
-            concat!(
-                "command -v /usr/bin/osascript >/dev/null",
-                " && command -v /usr/bin/pbcopy >/dev/null",
-                " && /usr/bin/osascript -l JavaScript -e ",
-                "'ObjC.import(\"AppKit\");ObjC.import(\"Foundation\");$.NSPasteboard.generalPasteboard;'",
-                " >/dev/null"
-            )
-            .to_string()
-        }
-        RemoteMode::LinuxWayland => {
-            let env_prefix = remote_env_prefix(dest);
-            [
-                "command -v timeout >/dev/null".to_string(),
-                "command -v wl-copy >/dev/null".to_string(),
-                "command -v wl-paste >/dev/null".to_string(),
-                "payload=pasteforward-doctor-$$".to_string(),
-                format!(
-                    "(printf \"$payload\" | {}wl-copy --paste-once --type text/plain >/dev/null 2>&1 &)",
-                    env_prefix
-                ),
-                "sleep 0.2".to_string(),
-                format!(
-                    "test \"$({}timeout 5 wl-paste --type text/plain 2>/dev/null)\" = \"$payload\"",
-                    env_prefix
-                ),
-            ]
-            .join(" && ")
-        }
-        RemoteMode::LinuxX11 => {
-            let env_prefix = remote_env_prefix(dest);
-            [
-                "command -v timeout >/dev/null".to_string(),
-                "command -v xclip >/dev/null".to_string(),
-                "payload=pasteforward-doctor-$$".to_string(),
-                format!(
-                    "(printf \"$payload\" | {}xclip -selection clipboard -loops 1 -i >/dev/null 2>&1 &)",
-                    env_prefix
-                ),
-                "sleep 0.2".to_string(),
-                format!(
-                    "test \"$({}timeout 5 xclip -selection clipboard -o 2>/dev/null)\" = \"$payload\"",
-                    env_prefix
-                ),
-            ]
-            .join(" && ")
-        }
-        RemoteMode::Auto => return false,
-    };
-    ssh(&dest.host, &command, None).is_ok()
-}
-
-fn remote_env_prefix(dest: &DestinationConfig) -> String {
-    if dest.remote_env.is_empty() {
-        return String::new();
-    }
-    let assignments = dest
-        .remote_env
-        .iter()
-        .map(|(key, value)| format!("{key}={}", shell_quote(value)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("{assignments} ")
+    remote_clipboard_probe_command(dest, remote_mode)
+        .and_then(|command| ssh(&dest.host, &command, None))
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -266,44 +136,55 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn dest() -> DestinationConfig {
-        DestinationConfig {
-            host: "user@example.test".to_string(),
+    #[test]
+    fn remote_directory_probe_is_read_only() {
+        let root = std::env::temp_dir().join(format!(
+            "pasteforward-doctor-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let nested = root.join("missing").join("nested");
+        let command = remote_dir_probe_command(&nested.to_string_lossy());
+        assert!(
+            std::process::Command::new("sh")
+                .args(["-c", &command])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(!nested.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn configured_display_probe_does_not_expand_unset_shell_state() {
+        let mut remote_env = BTreeMap::new();
+        remote_env.insert("DISPLAY".to_string(), ":99".to_string());
+        let dest = DestinationConfig {
+            host: "example.test".to_string(),
             enabled: true,
-            remote_mode: RemoteMode::MacosPasteboard,
+            remote_mode: RemoteMode::LinuxX11,
+            remote_env,
+            remote_dir: None,
+        };
+        let command = remote_clipboard_probe_command(&dest, &RemoteMode::LinuxX11).unwrap();
+        assert!(command.contains("export DISPLAY=':99'"));
+        assert!(command.contains("${DISPLAY"));
+        assert!(command.contains("/tmp/.X11-unix/X${display_number}"));
+    }
+
+    #[test]
+    fn prepare_boundary_rejects_root_alias_before_ssh() {
+        let mut config = AppConfig::empty();
+        config.remote_dir = "//".to_string();
+        let dest = DestinationConfig {
+            host: "example.test".to_string(),
+            enabled: true,
+            remote_mode: RemoteMode::LinuxX11,
             remote_env: BTreeMap::new(),
             remote_dir: None,
-        }
-    }
-
-    #[test]
-    fn builds_macos_clipboard_command() {
-        let command =
-            set_clipboard_command(&dest(), &RemoteMode::MacosPasteboard, "/tmp/a b.png").unwrap();
-        assert!(command.contains("/usr/bin/osascript"));
-        assert!(command.contains("-l JavaScript"));
-        assert!(command.contains("public.file-url"));
-        assert!(command.contains("public.png"));
-        assert!(command.contains("public.tiff"));
-        assert!(command.contains("/tmp/a b.png"));
-    }
-
-    #[test]
-    fn builds_linux_env_prefix() {
-        let mut d = dest();
-        d.remote_env.insert("DISPLAY".to_string(), ":0".to_string());
-        let command = set_clipboard_command(&d, &RemoteMode::LinuxX11, "/tmp/a.png").unwrap();
-        assert!(command.contains("DISPLAY=':0' xclip"));
-        assert!(command.contains(">/dev/null 2>&1 & sleep 0.2"));
-    }
-
-    #[test]
-    fn builds_wayland_detached_clipboard_command() {
-        let mut d = dest();
-        d.remote_env
-            .insert("WAYLAND_DISPLAY".to_string(), "wayland-1".to_string());
-        let command = set_clipboard_command(&d, &RemoteMode::LinuxWayland, "/tmp/a.png").unwrap();
-        assert!(command.contains("WAYLAND_DISPLAY='wayland-1' wl-copy"));
-        assert!(command.contains(">/dev/null 2>&1 & sleep 0.2"));
+        };
+        assert!(prepare_remote_directory(&config, &dest).is_err());
     }
 }

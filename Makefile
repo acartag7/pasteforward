@@ -1,7 +1,7 @@
 CARGO ?= cargo
 BIN := target/release/pasteforward
 
-.PHONY: build test fmt lint supply-chain verify clean install package
+.PHONY: build test integration fmt lint supply-chain verify clean install package
 
 build:
 	$(CARGO) build --locked --release
@@ -15,10 +15,14 @@ fmt:
 lint:
 	$(CARGO) clippy --locked --all-targets -- -D warnings
 
+integration: build
+	sh scripts/test-cli-boundaries.sh
+	sh scripts/test-open-homebrew-tap-pr.sh
+
 supply-chain:
 	sh scripts/check-supply-chain.sh
 
-verify: fmt lint test build supply-chain
+verify: fmt lint test integration supply-chain
 
 install: build
 	install -m 0755 $(BIN) $(HOME)/.local/bin/pasteforward

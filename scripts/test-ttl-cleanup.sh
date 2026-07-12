@@ -1,7 +1,9 @@
 #!/usr/bin/env sh
+# Remote commands interpolate only fixture values and validated PasteForward-generated paths.
+# shellcheck disable=SC2029
 set -eu
 
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 REAL_HOME="${HOME:?}"
 VM_NAME="${PASTEFORWARD_LIMA_VM:-pasteforward-linux}"
 BIN="${PASTEFORWARD_BIN:-$ROOT/target/release/pasteforward}"
@@ -117,7 +119,8 @@ fi
 remote_path="$(printf '%s\n' "$line" | awk '{ print $6 }')"
 PATH="$test_bin:$PATH" ssh "lima-$VM_NAME" "test -s '$remote_path'"
 
-perl -0pi -e 's/"ttl_seconds":\s*\d+/"ttl_seconds": 0/' "$config_home/config.json"
+perl -0pi -e 's/"ttl_seconds":\s*\d+/"ttl_seconds": 1/' "$config_home/config.json"
+sleep 2
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
   "$BIN" cleanup ttlvm
 

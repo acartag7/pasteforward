@@ -54,7 +54,7 @@ restore() {
   if [ "$service_was_installed" -eq 1 ]; then
     "$restore_bin" init "$RESTORE_DEST" --host "$RESTORE_HOST" --yes >/dev/null || true
   else
-    "$BIN" uninstall-service "$RESTORE_DEST" >/dev/null 2>&1 || true
+    "$BIN" uninstall-service >/dev/null 2>&1 || true
   fi
 }
 trap restore EXIT

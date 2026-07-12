@@ -1,7 +1,9 @@
 #!/usr/bin/env sh
+# Remote commands interpolate only fixture values and validated PasteForward-generated paths.
+# shellcheck disable=SC2029
 set -eu
 
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 REAL_HOME="${HOME:?}"
 VM_NAME="${PASTEFORWARD_LIMA_VM:-pasteforward-linux}"
 BIN="${PASTEFORWARD_BIN:-$ROOT/target/release/pasteforward}"
@@ -117,16 +119,15 @@ PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STAT
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
   "$BIN" doctor limawayland
 
+osascript -e "set the clipboard to (read POSIX file \"$png\" as «class PNGf»)"
+
 PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" \
   "$BIN" daemon >"$tmp/daemon.out" 2>"$tmp/daemon.err" &
 daemon_pid=$!
-sleep 1
-
-osascript -e "set the clipboard to (read POSIX file \"$png\" as «class PNGf»)"
 
 line=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  line="$(PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" "$BIN" history limawayland | tail -n 1 || true)"
+  line="$(PATH="$test_bin:$PATH" PASTEFORWARD_CONFIG_HOME="$config_home" PASTEFORWARD_STATE_HOME="$state_home" "$BIN" history limawayland | awk -v sha="$local_sha" '$5 == sha { line=$0 } END { print line }' || true)"
   [ -n "$line" ] && break
   sleep 1
 done

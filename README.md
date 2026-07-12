@@ -27,7 +27,33 @@ V0 supports:
 V0 does not support headless Linux native image paste. Headless remotes need a
 path-injection transport, not clipboard mirroring.
 
-## Install From Source
+## Install
+
+macOS or Linux with Homebrew:
+
+```sh
+brew install acartag7/tap/pasteforward
+```
+
+For a new release, this command becomes available after its post-release tap PR
+is reviewed and merged. Existing tap versions remain usable during publication.
+
+Debian or Ubuntu after downloading the matching release package:
+
+```sh
+sudo apt install ./pasteforward_<version>_<arch>.deb
+```
+
+Fedora or another RPM-based distribution:
+
+```sh
+sudo dnf install ./pasteforward-<version>-1.<arch>.rpm
+```
+
+Packages install only the binary. PasteForward never installs clipboard tools or
+starts a background service during package installation.
+
+### Install From Source
 
 Requires Rust 1.85+.
 
@@ -45,14 +71,21 @@ make install
 
 ## Quick Start
 
-Add a destination and install the background service:
+Run the guided setup:
+
+```sh
+pasteforward init
+```
+
+Or add a destination directly and install the background service:
 
 ```sh
 pasteforward init macmini --host user@mac.example
 ```
 
-`init` writes config, runs doctor checks, then asks whether to install or restart
-the local background service. The default answer is yes.
+`init` validates input and runs read-only doctor checks before writing config,
+then asks whether to install or restart the local background service. The
+default answer is yes.
 
 Then use your normal SSH session. PasteForward keeps forwarding images in the
 background:
@@ -76,13 +109,16 @@ pasteforward delete <dest> [--purge]
 pasteforward list
 pasteforward history [dest]
 pasteforward cleanup [dest]
-pasteforward install-service <dest> --host <ssh-host>
-pasteforward uninstall-service <dest> [--purge]
+pasteforward test <dest>
+pasteforward install-service
+pasteforward uninstall-service
 pasteforward daemon
 pasteforward --version
 ```
 
 `daemon` is mostly for debugging. Normal users should start it through `init`.
+`install-service` and `uninstall-service` only change the local background
+service. They keep destinations and history unchanged.
 
 Non-interactive service setup requires an explicit flag:
 
@@ -110,13 +146,16 @@ Wayland sessions may need `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.
 make verify
 ```
 
-This runs formatting checks, tests, build, and supply-chain checks.
+This runs formatting checks, tests, build, and supply-chain checks. The
+verification-only workflow pin check requires Ruby with its standard YAML
+library; Ruby is not a runtime dependency of PasteForward.
 
 On macOS with Lima installed, run the Linux integration tests:
 
 ```sh
 scripts/test-lima-x11.sh
 scripts/test-lima-wayland.sh
+scripts/test-lima-negative.sh
 ```
 
 Those tests create or start a Lima Ubuntu VM and verify local PNG clipboard
