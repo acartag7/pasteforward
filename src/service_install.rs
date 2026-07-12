@@ -7,6 +7,25 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SystemdEnablement {
+    Persistent,
+    Runtime,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SystemdActivity {
+    Active,
+    Inactive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SystemdState {
+    enablement: SystemdEnablement,
+    activity: SystemdActivity,
+}
+
 pub fn install_launch_agent(plist: &Path, label: &str, uid: u32) -> Result<()> {
     if let Some(parent) = plist.parent() {
         create_owner_only_dir(parent)?;
@@ -82,17 +101,20 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
         systemd_quote(&exe)
     );
     let previous = read_existing_service_file(unit)?;
-    let was_running = service_running();
-    let was_enabled = if previous.is_some() {
-        systemd_unit_enabled(unit_name)?
-    } else {
-        false
-    };
+    let previous_state = previous
+        .as_ref()
+        .map(|_| systemd_unit_state(unit_name))
+        .transpose()?;
     write_owner_only_atomic(unit, content.as_bytes())?;
     if let Err(error) = reload_and_enable_systemd(unit_name) {
-        return rollback_service_file(unit, previous.as_deref(), error, || {
-            restore_systemd_state(unit_name, previous.is_some(), was_enabled, was_running)
-        });
+        return rollback_systemd_install(
+            unit,
+            previous.as_deref(),
+            error,
+            unit_name,
+            previous_state,
+            systemctl,
+        );
     }
     Ok(())
 }
@@ -110,35 +132,104 @@ fn systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn systemd_unit_enabled(unit_name: &str) -> Result<bool> {
-    match systemctl(&["is-enabled", "--quiet", unit_name]) {
-        Ok(()) => Ok(true),
-        Err(Error::CommandFailed { code: Some(1), .. }) => Ok(false),
-        Err(error) => Err(error),
+fn systemd_unit_state(unit_name: &str) -> Result<SystemdState> {
+    let args = vec![
+        "--user".to_string(),
+        "show".to_string(),
+        "--property=UnitFileState".to_string(),
+        "--property=ActiveState".to_string(),
+        unit_name.to_string(),
+    ];
+    let output = run("systemctl", &args, None)?;
+    parse_systemd_state(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_systemd_state(output: &str) -> Result<SystemdState> {
+    let mut enablement = None;
+    let mut activity = None;
+    for line in output.lines() {
+        let Some((property, value)) = line.split_once('=') else {
+            return Err(Error::DoctorFailed(
+                "systemd returned a malformed unit state".to_string(),
+            ));
+        };
+        match (property, value) {
+            ("UnitFileState", "enabled") if enablement.is_none() => {
+                enablement = Some(SystemdEnablement::Persistent)
+            }
+            ("UnitFileState", "enabled-runtime") if enablement.is_none() => {
+                enablement = Some(SystemdEnablement::Runtime)
+            }
+            ("UnitFileState", "disabled") if enablement.is_none() => {
+                enablement = Some(SystemdEnablement::Disabled)
+            }
+            ("ActiveState", "active") if activity.is_none() => {
+                activity = Some(SystemdActivity::Active)
+            }
+            ("ActiveState", "inactive") if activity.is_none() => {
+                activity = Some(SystemdActivity::Inactive)
+            }
+            _ => {
+                return Err(Error::DoctorFailed(
+                    "systemd returned an unsupported unit state".to_string(),
+                ));
+            }
+        }
     }
+    Ok(SystemdState {
+        enablement: enablement.ok_or_else(|| {
+            Error::DoctorFailed("systemd omitted the unit enablement state".to_string())
+        })?,
+        activity: activity.ok_or_else(|| {
+            Error::DoctorFailed("systemd omitted the unit activity state".to_string())
+        })?,
+    })
+}
+
+fn rollback_systemd_install(
+    unit: &Path,
+    previous: Option<&[u8]>,
+    original: Error,
+    unit_name: &str,
+    previous_state: Option<SystemdState>,
+    mut invoke_systemctl: impl FnMut(&[&str]) -> Result<()>,
+) -> Result<()> {
+    let previous_state = match previous_state {
+        Some(state) => state,
+        None => {
+            let cleanup = invoke_systemctl(&["disable", "--now", unit_name]);
+            return rollback_service_file(unit, previous, original, || {
+                cleanup?;
+                invoke_systemctl(&["daemon-reload"])
+            });
+        }
+    };
+    rollback_service_file(unit, previous, original, || {
+        restore_systemd_state(unit_name, previous_state, &mut invoke_systemctl)
+    })
 }
 
 fn restore_systemd_state(
     unit_name: &str,
-    unit_existed: bool,
-    was_enabled: bool,
-    was_running: bool,
+    previous_state: SystemdState,
+    invoke_systemctl: &mut impl FnMut(&[&str]) -> Result<()>,
 ) -> Result<()> {
-    if !unit_existed {
-        systemctl(&["disable", "--now", unit_name])?;
-        return systemctl(&["daemon-reload"]);
+    invoke_systemctl(&["daemon-reload"])?;
+    match previous_state.enablement {
+        SystemdEnablement::Persistent => invoke_systemctl(&["enable", unit_name])?,
+        SystemdEnablement::Runtime => {
+            invoke_systemctl(&["disable", unit_name])?;
+            invoke_systemctl(&["enable", "--runtime", unit_name])?;
+        }
+        SystemdEnablement::Disabled => invoke_systemctl(&["disable", unit_name])?,
     }
-    systemctl(&["daemon-reload"])?;
-    let (enablement, activity) = systemd_restore_actions(was_enabled, was_running);
-    systemctl(&[enablement, unit_name])?;
-    systemctl(&[activity, unit_name])
-}
-
-fn systemd_restore_actions(was_enabled: bool, was_running: bool) -> (&'static str, &'static str) {
-    (
-        if was_enabled { "enable" } else { "disable" },
-        if was_running { "restart" } else { "stop" },
-    )
+    invoke_systemctl(&[
+        match previous_state.activity {
+            SystemdActivity::Active => "restart",
+            SystemdActivity::Inactive => "stop",
+        },
+        unit_name,
+    ])
 }
 
 fn restore_service_file(path: &Path, previous: Option<&[u8]>) -> Result<()> {
@@ -208,6 +299,8 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    type SystemdRestoreCase = (&'static str, Option<SystemdState>, Vec<Vec<String>>);
+
     #[test]
     fn rollback_restores_previous_service_file() {
         let root = test_dir("restore");
@@ -246,11 +339,201 @@ mod tests {
     }
 
     #[test]
-    fn systemd_restore_matrix_preserves_enablement_and_running_state() {
-        assert_eq!(systemd_restore_actions(true, true), ("enable", "restart"));
-        assert_eq!(systemd_restore_actions(true, false), ("enable", "stop"));
-        assert_eq!(systemd_restore_actions(false, true), ("disable", "restart"));
-        assert_eq!(systemd_restore_actions(false, false), ("disable", "stop"));
+    fn parses_only_restorable_systemd_states() {
+        assert_eq!(
+            parse_systemd_state("ActiveState=active\nUnitFileState=enabled\n").unwrap(),
+            SystemdState {
+                enablement: SystemdEnablement::Persistent,
+                activity: SystemdActivity::Active,
+            }
+        );
+        assert_eq!(
+            parse_systemd_state("UnitFileState=enabled-runtime\nActiveState=inactive\n").unwrap(),
+            SystemdState {
+                enablement: SystemdEnablement::Runtime,
+                activity: SystemdActivity::Inactive,
+            }
+        );
+        assert!(parse_systemd_state("UnitFileState=static\nActiveState=active\n").is_err());
+        assert!(parse_systemd_state("UnitFileState=enabled\nActiveState=activating\n").is_err());
+        assert!(parse_systemd_state("UnitFileState=disabled\n").is_err());
+        assert!(parse_systemd_state("").is_err());
+    }
+
+    #[test]
+    fn systemd_rollback_restores_every_enablement_and_running_state() {
+        for (label, state, expected) in systemd_restore_cases() {
+            let root = test_dir(label);
+            create_owner_only_dir(&root).unwrap();
+            let path = root.join("service");
+            let previous = state.map(|_| b"previous".as_slice());
+            write_owner_only_atomic(&path, b"candidate").unwrap();
+            let mut trace = Vec::new();
+            let result = rollback_systemd_install(
+                &path,
+                previous,
+                Error::DoctorFailed("activate failed".to_string()),
+                "pasteforward.service",
+                state,
+                |args| {
+                    trace.push(
+                        args.iter()
+                            .map(|arg| (*arg).to_string())
+                            .collect::<Vec<_>>(),
+                    );
+                    Ok(())
+                },
+            );
+            assert!(
+                matches!(result, Err(Error::DoctorFailed(message)) if message == "activate failed")
+            );
+            assert_eq!(trace, expected, "state case {label}");
+            if previous.is_some() {
+                assert_eq!(fs::read(&path).unwrap(), b"previous");
+            } else {
+                assert!(!path.exists());
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn systemd_rollback_propagates_every_command_failure_after_file_restore() {
+        for (label, state, expected) in systemd_restore_cases() {
+            for fail_at in 0..expected.len() {
+                let root = test_dir(&format!("{label}-{fail_at}"));
+                create_owner_only_dir(&root).unwrap();
+                let path = root.join("service");
+                let previous = state.map(|_| b"previous".as_slice());
+                write_owner_only_atomic(&path, b"candidate").unwrap();
+                let mut trace = Vec::new();
+                let result = rollback_systemd_install(
+                    &path,
+                    previous,
+                    Error::DoctorFailed("activate failed".to_string()),
+                    "pasteforward.service",
+                    state,
+                    |args| {
+                        trace.push(
+                            args.iter()
+                                .map(|arg| (*arg).to_string())
+                                .collect::<Vec<_>>(),
+                        );
+                        if trace.len() - 1 == fail_at {
+                            Err(Error::DoctorFailed("systemctl failed".to_string()))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                assert!(
+                    matches!(result, Err(Error::DoctorFailed(message)) if message.contains("service state could not be restored"))
+                );
+                assert_eq!(
+                    trace,
+                    expected[..=fail_at],
+                    "state case {label}, failure {fail_at}"
+                );
+                if previous.is_some() {
+                    assert_eq!(fs::read(&path).unwrap(), b"previous");
+                } else {
+                    assert!(!path.exists());
+                }
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    fn systemd_restore_cases() -> Vec<SystemdRestoreCase> {
+        let commands = |rows: &[&[&str]]| {
+            rows.iter()
+                .map(|row| row.iter().map(|value| (*value).to_string()).collect())
+                .collect()
+        };
+        vec![
+            (
+                "new",
+                None,
+                commands(&[
+                    &["disable", "--now", "pasteforward.service"],
+                    &["daemon-reload"],
+                ]),
+            ),
+            (
+                "persistent-running",
+                Some(SystemdState {
+                    enablement: SystemdEnablement::Persistent,
+                    activity: SystemdActivity::Active,
+                }),
+                commands(&[
+                    &["daemon-reload"],
+                    &["enable", "pasteforward.service"],
+                    &["restart", "pasteforward.service"],
+                ]),
+            ),
+            (
+                "persistent-stopped",
+                Some(SystemdState {
+                    enablement: SystemdEnablement::Persistent,
+                    activity: SystemdActivity::Inactive,
+                }),
+                commands(&[
+                    &["daemon-reload"],
+                    &["enable", "pasteforward.service"],
+                    &["stop", "pasteforward.service"],
+                ]),
+            ),
+            (
+                "runtime-running",
+                Some(SystemdState {
+                    enablement: SystemdEnablement::Runtime,
+                    activity: SystemdActivity::Active,
+                }),
+                commands(&[
+                    &["daemon-reload"],
+                    &["disable", "pasteforward.service"],
+                    &["enable", "--runtime", "pasteforward.service"],
+                    &["restart", "pasteforward.service"],
+                ]),
+            ),
+            (
+                "runtime-stopped",
+                Some(SystemdState {
+                    enablement: SystemdEnablement::Runtime,
+                    activity: SystemdActivity::Inactive,
+                }),
+                commands(&[
+                    &["daemon-reload"],
+                    &["disable", "pasteforward.service"],
+                    &["enable", "--runtime", "pasteforward.service"],
+                    &["stop", "pasteforward.service"],
+                ]),
+            ),
+            (
+                "disabled-running",
+                Some(SystemdState {
+                    enablement: SystemdEnablement::Disabled,
+                    activity: SystemdActivity::Active,
+                }),
+                commands(&[
+                    &["daemon-reload"],
+                    &["disable", "pasteforward.service"],
+                    &["restart", "pasteforward.service"],
+                ]),
+            ),
+            (
+                "disabled-stopped",
+                Some(SystemdState {
+                    enablement: SystemdEnablement::Disabled,
+                    activity: SystemdActivity::Inactive,
+                }),
+                commands(&[
+                    &["daemon-reload"],
+                    &["disable", "pasteforward.service"],
+                    &["stop", "pasteforward.service"],
+                ]),
+            ),
+        ]
     }
 
     fn test_dir(label: &str) -> std::path::PathBuf {
