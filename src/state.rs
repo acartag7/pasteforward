@@ -167,20 +167,22 @@ pub fn write_pid() -> Result<()> {
     prepare_state_directory()?;
     write_pid_at(
         &pid_path()?,
+        &ready_path()?,
         &state_dir()?.join("daemon.lock"),
         std::process::id(),
     )
 }
 
-fn write_pid_at(path: &Path, lock_path: &Path, current_pid: u32) -> Result<()> {
+fn write_pid_at(path: &Path, ready_path: &Path, lock_path: &Path, current_pid: u32) -> Result<()> {
     let _lock = lock_file(lock_path, true)?;
     if let Some(pid) = read_pid_marker_for_mutation(path)? {
-        if pid != current_pid && process_alive(pid) {
+        if pid != current_pid && process_alive(pid) && process_is_pasteforward_daemon(pid) {
             return Err(Error::DoctorFailed(format!(
                 "pasteforward daemon is already running with pid {pid}"
             )));
         }
     }
+    clear_marker_unlocked(ready_path)?;
     write_owner_only_atomic(path, current_pid.to_string().as_bytes())?;
     Ok(())
 }
@@ -513,12 +515,12 @@ mod tests {
         let ready_path = root.join("daemon.ready");
         let lock_path = root.join("daemon.lock");
         std::fs::write(&pid_path, b"truncated").unwrap();
-        write_pid_at(&pid_path, &lock_path, 123).unwrap();
+        write_pid_at(&pid_path, &ready_path, &lock_path, 123).unwrap();
         assert_eq!(read_pid_marker(&pid_path).unwrap(), Some(123));
 
         std::fs::write(&pid_path, vec![b'1'; MAX_PID_MARKER_BYTES as usize + 1]).unwrap();
         assert!(read_pid_marker(&pid_path).is_err());
-        write_pid_at(&pid_path, &lock_path, 456).unwrap();
+        write_pid_at(&pid_path, &ready_path, &lock_path, 456).unwrap();
         assert_eq!(read_pid_marker(&pid_path).unwrap(), Some(456));
 
         std::fs::write(&ready_path, b"not-a-pid").unwrap();
@@ -528,6 +530,57 @@ mod tests {
         std::fs::write(&ready_path, vec![b'2'; MAX_PID_MARKER_BYTES as usize + 1]).unwrap();
         assert!(read_pid_marker(&ready_path).is_err());
         assert_eq!(read_pid_marker_for_mutation(&ready_path).unwrap(), None);
+        assert!(!ready_path.exists());
+
+        std::fs::write(&pid_path, b"truncated").unwrap();
+        std::fs::write(&ready_path, b"123").unwrap();
+        assert_eq!(
+            read_pid_for_stop_at(&pid_path, &ready_path, &lock_path, || {}).unwrap(),
+            None
+        );
+        assert!(!pid_path.exists());
+        assert!(!ready_path.exists());
+
+        std::fs::write(&pid_path, vec![b'3'; MAX_PID_MARKER_BYTES as usize + 1]).unwrap();
+        std::fs::write(&ready_path, b"123").unwrap();
+        assert_eq!(
+            read_pid_for_stop_at(&pid_path, &ready_path, &lock_path, || {}).unwrap(),
+            None
+        );
+        assert!(!pid_path.exists());
+        assert!(!ready_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_pid_replaces_a_live_pid_that_is_not_a_pasteforward_daemon() {
+        let root = std::env::temp_dir().join(format!(
+            "pasteforward-reused-pid-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_path = root.join("daemon.pid");
+        let ready_path = root.join("daemon.ready");
+        let lock_path = root.join("daemon.lock");
+        let live_non_daemon_pid = std::process::id();
+        let replacement_pid = live_non_daemon_pid.checked_add(1).unwrap();
+        assert!(process_alive(live_non_daemon_pid));
+        assert!(!process_is_pasteforward_daemon(live_non_daemon_pid));
+
+        std::fs::write(&pid_path, live_non_daemon_pid.to_string()).unwrap();
+        std::fs::write(&ready_path, live_non_daemon_pid.to_string()).unwrap();
+        write_pid_at(&pid_path, &ready_path, &lock_path, replacement_pid).unwrap();
+
+        assert_eq!(read_pid_marker(&pid_path).unwrap(), Some(replacement_pid));
+        assert!(!ready_path.exists());
+
+        std::fs::write(&ready_path, replacement_pid.to_string()).unwrap();
+        write_pid_at(&pid_path, &ready_path, &lock_path, replacement_pid).unwrap();
         assert!(!ready_path.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -657,7 +710,7 @@ mod tests {
         let publish_lock = lock_path.clone();
         let (published_sender, published_receiver) = std::sync::mpsc::channel();
         let publisher = std::thread::spawn(move || {
-            write_pid_at(&publish_pid, &publish_lock, 222).unwrap();
+            write_pid_at(&publish_pid, &publish_ready, &publish_lock, 222).unwrap();
             write_daemon_ready_at(&publish_ready, &publish_lock, 222).unwrap();
             published_sender.send(()).unwrap();
         });
@@ -673,7 +726,7 @@ mod tests {
         assert_eq!(read_pid_marker(&ready_path).unwrap(), Some(222));
 
         std::fs::remove_file(&pid_path).unwrap();
-        write_pid_at(&pid_path, &lock_path, 333).unwrap();
+        write_pid_at(&pid_path, &ready_path, &lock_path, 333).unwrap();
         write_daemon_ready_at(&ready_path, &lock_path, 333).unwrap();
         let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
         let (release_sender, release_receiver) = std::sync::mpsc::channel();

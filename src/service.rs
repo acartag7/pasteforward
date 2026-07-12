@@ -178,14 +178,14 @@ pub(crate) fn stop_recorded_daemon() -> Result<()> {
 }
 
 pub(crate) fn recorded_daemon_pid() -> Result<Option<u32>> {
-    let Some(pid) = read_pid()? else {
+    let Some(pid) = read_pid_for_stop()? else {
         return Ok(None);
     };
     Ok(recorded_daemon_pid_running(pid).then_some(pid))
 }
 
 pub(crate) fn recorded_daemon_pid_is_running(expected_pid: u32) -> Result<bool> {
-    Ok(read_pid()? == Some(expected_pid) && recorded_daemon_pid_running(expected_pid))
+    Ok(read_pid_for_stop()? == Some(expected_pid) && recorded_daemon_pid_running(expected_pid))
 }
 
 fn recorded_daemon_pid_running(expected_pid: u32) -> bool {
