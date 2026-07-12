@@ -89,15 +89,23 @@ pub fn install_launch_agent(
                 })
             },
             before_rollback,
+            || restore_service_file(plist, previous.as_deref()),
             || {
-                rollback_service_file(plist, previous.as_deref(), failure.error, || {
+                let original = failure.error;
+                let state_restore = (|| {
                     if was_running && previous.is_some() {
                         bootstrap_launch_agent(plist, uid)?;
                         wait_for_recorded_daemon_ready()
                     } else {
                         Ok(())
                     }
-                })
+                })();
+                match state_restore {
+                    Ok(()) => Err(original),
+                    Err(restore) => Err(Error::DoctorFailed(format!(
+                        "service activation failed ({original}) and service state could not be restored ({restore})"
+                    ))),
+                }
             },
         )?;
         return complete_service_rollback(
@@ -201,22 +209,26 @@ fn rollback_after_config_restore(
     activation_error: &str,
     cleanup_candidate: impl FnOnce() -> Result<()>,
     restore_config: impl FnOnce() -> Result<()>,
+    restore_previous_file: impl FnOnce() -> Result<()>,
     restore_previous_service: impl FnOnce() -> Result<()>,
 ) -> Result<Result<()>> {
     let candidate_cleanup = cleanup_candidate();
     let config_restore = restore_config();
-    match (candidate_cleanup, config_restore) {
-        (Ok(()), Ok(())) => Ok(restore_previous_service()),
-        (Err(cleanup), Ok(())) => Err(Error::DoctorFailed(format!(
-            "service activation failed ({activation_error}) and candidate cleanup failed ({cleanup})"
-        ))),
-        (Ok(()), Err(config)) => Err(Error::DoctorFailed(format!(
-            "service activation failed ({activation_error}) and configuration restoration failed ({config})"
-        ))),
-        (Err(cleanup), Err(config)) => Err(Error::DoctorFailed(format!(
-            "service activation failed ({activation_error}), candidate cleanup failed ({cleanup}), and configuration restoration failed ({config})"
-        ))),
+    let file_restore = restore_previous_file();
+    if candidate_cleanup.is_ok() && config_restore.is_ok() && file_restore.is_ok() {
+        return Ok(restore_previous_service());
     }
+    let mut errors = vec![format!("service activation failed ({activation_error})")];
+    if let Err(cleanup) = candidate_cleanup {
+        errors.push(format!("candidate cleanup failed ({cleanup})"));
+    }
+    if let Err(config) = config_restore {
+        errors.push(format!("configuration restoration failed ({config})"));
+    }
+    if let Err(file) = file_restore {
+        errors.push(format!("service definition restoration failed ({file})"));
+    }
+    Err(Error::DoctorFailed(errors.join(" and ")))
 }
 
 pub fn install_systemd_user(
@@ -252,15 +264,15 @@ pub fn install_systemd_user(
             &activation_error,
             || cleanup_systemd_candidate(unit_name, systemctl),
             before_rollback,
+            || restore_service_file(unit, previous.as_deref()),
             || {
-                rollback_systemd_install(
-                    unit,
-                    previous.as_deref(),
-                    error,
-                    unit_name,
-                    previous_state,
-                    systemctl,
-                )
+                let state_restore = restore_systemd_runtime(unit_name, previous_state, systemctl);
+                match state_restore {
+                    Ok(()) => Err(error),
+                    Err(restore) => Err(Error::DoctorFailed(format!(
+                        "service activation failed ({error}) and service state could not be restored ({restore})"
+                    ))),
+                }
             },
         )?;
         return complete_service_rollback(
@@ -392,6 +404,7 @@ fn parse_systemd_state(output: &str) -> Result<SystemdState> {
     })
 }
 
+#[cfg(test)]
 fn rollback_systemd_install(
     unit: &Path,
     previous: Option<&[u8]>,
@@ -400,17 +413,20 @@ fn rollback_systemd_install(
     previous_state: Option<SystemdState>,
     mut invoke_systemctl: impl FnMut(&[&str]) -> Result<()>,
 ) -> Result<()> {
-    let previous_state = match previous_state {
-        Some(state) => state,
-        None => {
-            return rollback_service_file(unit, previous, original, || {
-                invoke_systemctl(&["daemon-reload"])
-            });
-        }
-    };
     rollback_service_file(unit, previous, original, || {
-        restore_systemd_state(unit_name, previous_state, &mut invoke_systemctl)
+        restore_systemd_runtime(unit_name, previous_state, &mut invoke_systemctl)
     })
+}
+
+fn restore_systemd_runtime(
+    unit_name: &str,
+    previous_state: Option<SystemdState>,
+    mut invoke_systemctl: impl FnMut(&[&str]) -> Result<()>,
+) -> Result<()> {
+    match previous_state {
+        Some(state) => restore_systemd_state(unit_name, state, &mut invoke_systemctl),
+        None => invoke_systemctl(&["daemon-reload"]),
+    }
 }
 
 fn restore_systemd_state(
@@ -471,6 +487,7 @@ fn read_existing_service_file(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(content))
 }
 
+#[cfg(test)]
 fn rollback_service_file(
     path: &Path,
     previous: Option<&[u8]>,
@@ -688,17 +705,23 @@ mod tests {
     fn launch_agent_cleanup_failure_blocks_prior_service_reactivation() {
         use std::cell::Cell;
 
+        let prior_file_restore_attempted = Cell::new(false);
         let prior_agent_restore_attempted = Cell::new(false);
         let result = rollback_after_config_restore(
             "activation failed",
             || Err(Error::DoctorFailed("candidate bootout failed".to_string())),
             || Ok(()),
             || {
+                prior_file_restore_attempted.set(true);
+                Ok(())
+            },
+            || {
                 prior_agent_restore_attempted.set(true);
                 Ok(())
             },
         );
 
+        assert!(prior_file_restore_attempted.get());
         assert!(!prior_agent_restore_attempted.get());
         assert!(
             matches!(result, Err(Error::DoctorFailed(message)) if message.contains("activation failed") && message.contains("candidate bootout failed"))
@@ -994,6 +1017,10 @@ mod tests {
                 Ok(())
             },
             || {
+                trace.borrow_mut().push("prior-file-restore");
+                Ok(())
+            },
+            || {
                 trace.borrow_mut().push("prior-service-restore");
                 Ok(())
             },
@@ -1005,20 +1032,27 @@ mod tests {
             vec![
                 "candidate-cleanup",
                 "config-restore",
+                "prior-file-restore",
                 "prior-service-restore"
             ]
         );
 
+        let prior_file_restored = Cell::new(false);
         let prior_service_restored = Cell::new(false);
         let result = rollback_after_config_restore(
             &activation,
             || Err(Error::DoctorFailed("candidate cleanup failed".to_string())),
             || Err(Error::DoctorFailed("config restore failed".to_string())),
             || {
+                prior_file_restored.set(true);
+                Ok(())
+            },
+            || {
                 prior_service_restored.set(true);
                 Ok(())
             },
         );
+        assert!(prior_file_restored.get());
         assert!(!prior_service_restored.get());
         assert!(
             matches!(result, Err(Error::DoctorFailed(message)) if message.contains("activation failed") && message.contains("candidate cleanup failed") && message.contains("config restore failed"))

@@ -8,10 +8,33 @@ pub fn resolve_remote_mode(dest: &DestinationConfig) -> Result<RemoteMode> {
     if dest.remote_mode != RemoteMode::Auto {
         return Ok(dest.remote_mode.clone());
     }
-    let script = r#"uname_s="$(uname -s 2>/dev/null || true)"
+    let command = format!(
+        "{}{}",
+        remote_env_exports(dest)?,
+        remote_mode_probe_script()
+    );
+    let output = ssh(&dest.host, &command, None)?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    RemoteMode::parse(&value).map_err(|_| {
+        Error::DoctorFailed(format!(
+            "remote clipboard backend not found on {}; install wl-clipboard or xclip for Linux GUI remotes",
+            dest.host
+        ))
+    })
+}
+
+fn remote_mode_probe_script() -> &'static str {
+    r#"uname_s="$(uname -s 2>/dev/null || true)"
+wayland_socket=""
+if test -n "${WAYLAND_DISPLAY:-}"; then
+  case "$WAYLAND_DISPLAY" in
+    /*) wayland_socket="$WAYLAND_DISPLAY" ;;
+    *) if test -n "${XDG_RUNTIME_DIR:-}"; then wayland_socket="${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"; fi ;;
+  esac
+fi
 if [ "$uname_s" = "Darwin" ]; then
   printf macos-pasteboard
-elif command -v wl-copy >/dev/null 2>&1 && command -v wl-paste >/dev/null 2>&1 && test -n "${XDG_RUNTIME_DIR:-}" && test -n "${WAYLAND_DISPLAY:-}" && test -S "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" && test -r "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" && test -w "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"; then
+elif command -v wl-copy >/dev/null 2>&1 && command -v wl-paste >/dev/null 2>&1 && test -n "$wayland_socket" && test -S "$wayland_socket" && test -r "$wayland_socket" && test -w "$wayland_socket"; then
   printf linux-wayland
 elif command -v xclip >/dev/null 2>&1 && test -n "${DISPLAY:-}"; then
   display_number="${DISPLAY#*:}"
@@ -22,16 +45,7 @@ elif command -v xclip >/dev/null 2>&1 && test -n "${DISPLAY:-}"; then
   esac
 else
   printf unsupported
-fi"#;
-    let command = format!("{}{}", remote_env_exports(dest)?, script);
-    let output = ssh(&dest.host, &command, None)?;
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    RemoteMode::parse(&value).map_err(|_| {
-        Error::DoctorFailed(format!(
-            "remote clipboard backend not found on {}; install wl-clipboard or xclip for Linux GUI remotes",
-            dest.host
-        ))
-    })
+fi"#
 }
 
 pub fn sync_remote_image_command(
@@ -196,10 +210,11 @@ pub(crate) fn remote_clipboard_probe_command(
         .to_string(),
         RemoteMode::LinuxWayland => concat!(
             "command -v timeout >/dev/null && command -v wl-copy >/dev/null && command -v wl-paste >/dev/null",
-            " && test -n \"${XDG_RUNTIME_DIR:-}\" && test -n \"${WAYLAND_DISPLAY:-}\"",
-            " && test -S \"${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}\"",
-            " && test -r \"${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}\"",
-            " && test -w \"${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}\"",
+            " && test -n \"${WAYLAND_DISPLAY:-}\"",
+            " && wayland_socket= && case \"$WAYLAND_DISPLAY\" in /*) wayland_socket=\"$WAYLAND_DISPLAY\" ;; *) test -n \"${XDG_RUNTIME_DIR:-}\" && wayland_socket=\"${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}\" ;; esac",
+            " && test -S \"$wayland_socket\"",
+            " && test -r \"$wayland_socket\"",
+            " && test -w \"$wayland_socket\"",
             " && probe_status=0 && probe_output=\"$(timeout 2 wl-paste --list-types 2>&1 >/dev/null)\" || probe_status=$?",
             " && if test \"$probe_status\" -ne 0; then case \"$probe_output\" in \"No selection\"|\"Nothing is copied\") true ;; *) false ;; esac; fi"
         )
@@ -273,8 +288,137 @@ mod tests {
     #[test]
     fn auto_detection_requires_a_reachable_session_and_falls_back_to_x11() {
         let script = include_str!("remote.rs");
-        assert!(script.contains("test -S \"${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}\""));
+        assert!(script.contains("/*) wayland_socket=\"$WAYLAND_DISPLAY\""));
+        assert!(script.contains("test -S \"$wayland_socket\""));
         assert!(script.contains("elif command -v xclip"));
         assert!(script.contains("/tmp/.X11-unix/X${display_number}"));
+    }
+
+    #[test]
+    fn wayland_probe_supports_absolute_display_sockets() {
+        let command = remote_clipboard_probe_command(&dest(), &RemoteMode::LinuxWayland).unwrap();
+        assert!(
+            command
+                .contains("case \"$WAYLAND_DISPLAY\" in /*) wayland_socket=\"$WAYLAND_DISPLAY\"")
+        );
+        assert!(command.contains("test -S \"$wayland_socket\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wayland_socket_resolution_executes_for_absolute_relative_and_x11_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        use std::process::Command;
+
+        let root =
+            std::path::PathBuf::from(format!("/tmp/pf-remote-socket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for (name, content) in [
+            ("uname", "#!/bin/sh\nprintf '%s\\n' Linux\n"),
+            ("wl-copy", "#!/bin/sh\nexit 0\n"),
+            ("wl-paste", "#!/bin/sh\nexit 0\n"),
+            ("xclip", "#!/bin/sh\nexit 0\n"),
+            ("timeout", "#!/bin/sh\nshift\nexec \"$@\"\n"),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, content).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let run = |script: &str,
+                   wayland_display: Option<&std::path::Path>,
+                   runtime_dir: Option<&std::path::Path>,
+                   display: Option<&str>| {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg(script)
+                .env(
+                    "PATH",
+                    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                )
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("XDG_RUNTIME_DIR")
+                .env_remove("DISPLAY");
+            if let Some(path) = wayland_display {
+                command.env("WAYLAND_DISPLAY", path);
+            }
+            if let Some(path) = runtime_dir {
+                command.env("XDG_RUNTIME_DIR", path);
+            }
+            if let Some(value) = display {
+                command.env("DISPLAY", value);
+            }
+            command.output().unwrap()
+        };
+
+        let absolute = root.join("absolute socket; $(not-run)");
+        let absolute_listener = UnixListener::bind(&absolute).unwrap();
+        let auto = remote_mode_probe_script();
+        assert_eq!(
+            String::from_utf8(run(auto, Some(&absolute), None, None).stdout).unwrap(),
+            "linux-wayland"
+        );
+        let probe = remote_clipboard_probe_command(&dest(), &RemoteMode::LinuxWayland).unwrap();
+        assert!(run(&probe, Some(&absolute), None, None).status.success());
+
+        let runtime = root.join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let relative = runtime.join("wayland-0");
+        let relative_listener = UnixListener::bind(&relative).unwrap();
+        assert_eq!(
+            String::from_utf8(
+                run(
+                    auto,
+                    Some(std::path::Path::new("wayland-0")),
+                    Some(&runtime),
+                    None,
+                )
+                .stdout,
+            )
+            .unwrap(),
+            "linux-wayland"
+        );
+        assert_eq!(
+            String::from_utf8(
+                run(auto, Some(std::path::Path::new("wayland-0")), None, None,).stdout,
+            )
+            .unwrap(),
+            "unsupported"
+        );
+        assert!(
+            !run(&probe, Some(std::path::Path::new("wayland-0")), None, None,)
+                .status
+                .success()
+        );
+
+        let x11_dir = root.join("x11");
+        std::fs::create_dir(&x11_dir).unwrap();
+        let display_number = "42117";
+        let x11_listener = UnixListener::bind(x11_dir.join(format!("X{display_number}"))).unwrap();
+        let x11_script = auto.replace("/tmp/.X11-unix", &x11_dir.to_string_lossy());
+        assert_eq!(
+            String::from_utf8(
+                run(
+                    &x11_script,
+                    Some(std::path::Path::new("/missing/wayland-0")),
+                    None,
+                    Some(&format!(":{display_number}")),
+                )
+                .stdout,
+            )
+            .unwrap(),
+            "linux-x11"
+        );
+
+        drop(x11_listener);
+        drop(relative_listener);
+        drop(absolute_listener);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
