@@ -78,6 +78,7 @@ pub fn systemd_quote(path: &Path) -> String {
         path.to_string_lossy()
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
+            .replace('%', "%%")
     )
 }
 
@@ -92,6 +93,10 @@ mod tests {
             "\"/tmp/Paste Forward/bin\""
         );
         assert_eq!(systemd_quote(Path::new("/tmp/a\"b")), "\"/tmp/a\\\"b\"");
+        assert_eq!(
+            systemd_quote(Path::new("/tmp/build%h/pasteforward")),
+            "\"/tmp/build%%h/pasteforward\""
+        );
     }
 
     #[cfg(unix)]

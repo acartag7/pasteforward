@@ -2,7 +2,7 @@ use pasteforward::config::{load_config, save_config};
 use pasteforward::daemon::{cleanup_expired, run_daemon, sync_one_without_history};
 use pasteforward::doctor::{doctor_destination, local_doctor_problem};
 use pasteforward::error::{Error, Result};
-use pasteforward::history::{purge_destination_history, read_history};
+use pasteforward::history::{HistoryEvent, purge_destination_history, read_history};
 use pasteforward::remote::read_clipboard_command;
 use pasteforward::service::{
     ServiceStatus, install_service, restart_service_if_installed, service_running, service_status,
@@ -316,12 +316,16 @@ fn cmd_history(args: Vec<String>) -> Result<()> {
     let destination = args.first().map(String::as_str);
     let events = read_history(destination, 50)?;
     for event in events {
-        println!(
-            "{} {} {} bytes {} {}",
-            event.unix_ms, event.destination, event.bytes, event.sha256, event.remote_path
-        );
+        println!("{}", history_line(&event));
     }
     Ok(())
+}
+
+fn history_line(event: &HistoryEvent) -> String {
+    format!(
+        "{} {} {} bytes {} {}",
+        event.unix_ms, event.destination, event.bytes, event.sha256, event.remote_path
+    )
 }
 
 fn cmd_cleanup(args: Vec<String>) -> Result<()> {
@@ -346,6 +350,33 @@ mod tests {
         let message = "failed printing to stdout: Broken pipe (os error 32)".to_string();
         assert!(panic_payload_is_broken_pipe(&message));
         assert!(!panic_payload_is_broken_pipe(&"other panic"));
+    }
+
+    #[test]
+    fn history_lines_keep_the_sha_in_the_fifth_field() {
+        let event = HistoryEvent {
+            schema_version: 1,
+            unix_ms: 42,
+            destination: "limaone".to_string(),
+            host: "lima-pasteforward-linux".to_string(),
+            sha256: "abc123".to_string(),
+            bytes: 67,
+            remote_path: "/tmp/pasteforward/limaone.png".to_string(),
+            remote_mode: pasteforward::config::RemoteMode::LinuxX11,
+            image_history_path: None,
+        };
+
+        assert_eq!(
+            history_line(&event).split_whitespace().collect::<Vec<_>>(),
+            vec![
+                "42",
+                "limaone",
+                "67",
+                "bytes",
+                "abc123",
+                "/tmp/pasteforward/limaone.png",
+            ]
+        );
     }
 }
 mod cli_io;

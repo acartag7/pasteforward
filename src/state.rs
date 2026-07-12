@@ -339,19 +339,20 @@ fn read_pid_marker(path: &Path) -> Result<Option<u32>> {
         Err(error) => return Err(error),
     };
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_PID_MARKER_BYTES {
+    if !metadata.is_file() {
         return Err(Error::DoctorFailed(
-            "daemon state marker is not a bounded regular file".to_string(),
+            "daemon state marker is not a regular file".to_string(),
         ));
+    }
+    if metadata.len() > MAX_PID_MARKER_BYTES {
+        return Err(Error::MalformedDaemonMarker);
     }
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
         .take(MAX_PID_MARKER_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_PID_MARKER_BYTES {
-        return Err(Error::DoctorFailed(
-            "daemon state marker exceeds its size limit".to_string(),
-        ));
+        return Err(Error::MalformedDaemonMarker);
     }
     let value = std::str::from_utf8(&bytes)
         .ok()
@@ -515,7 +516,17 @@ mod tests {
         write_pid_at(&pid_path, &lock_path, 123).unwrap();
         assert_eq!(read_pid_marker(&pid_path).unwrap(), Some(123));
 
+        std::fs::write(&pid_path, vec![b'1'; MAX_PID_MARKER_BYTES as usize + 1]).unwrap();
+        assert!(read_pid_marker(&pid_path).is_err());
+        write_pid_at(&pid_path, &lock_path, 456).unwrap();
+        assert_eq!(read_pid_marker(&pid_path).unwrap(), Some(456));
+
         std::fs::write(&ready_path, b"not-a-pid").unwrap();
+        assert_eq!(read_pid_marker_for_mutation(&ready_path).unwrap(), None);
+        assert!(!ready_path.exists());
+
+        std::fs::write(&ready_path, vec![b'2'; MAX_PID_MARKER_BYTES as usize + 1]).unwrap();
+        assert!(read_pid_marker(&ready_path).is_err());
         assert_eq!(read_pid_marker_for_mutation(&ready_path).unwrap(), None);
         assert!(!ready_path.exists());
         std::fs::remove_dir_all(root).unwrap();

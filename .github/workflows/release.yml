@@ -186,7 +186,10 @@ jobs:
             extracted="${tarball#./}"
             "${extracted%.tar.gz}/pasteforward" --version
           )
-          gh attestation verify downloaded/* --repo "${GITHUB_REPOSITORY}"
+          for artifact in downloaded/*; do
+            test -f "${artifact}" || continue
+            gh attestation verify "${artifact}" --repo "${GITHUB_REPOSITORY}"
+          done
 
   formula:
     needs: assets
