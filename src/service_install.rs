@@ -83,16 +83,15 @@ pub fn install_systemd_user(unit: &Path, unit_name: &str) -> Result<()> {
     );
     let previous = read_existing_service_file(unit)?;
     let was_running = service_running();
+    let was_enabled = if previous.is_some() {
+        systemd_unit_enabled(unit_name)?
+    } else {
+        false
+    };
     write_owner_only_atomic(unit, content.as_bytes())?;
     if let Err(error) = reload_and_enable_systemd(unit_name) {
-        let _ = systemctl(&["disable", "--now", unit_name]);
         return rollback_service_file(unit, previous.as_deref(), error, || {
-            systemctl(&["daemon-reload"])?;
-            if was_running && previous.is_some() {
-                reload_and_enable_systemd(unit_name)
-            } else {
-                Ok(())
-            }
+            restore_systemd_state(unit_name, previous.is_some(), was_enabled, was_running)
         });
     }
     Ok(())
@@ -109,6 +108,37 @@ fn systemctl(args: &[&str]) -> Result<()> {
         .collect::<Vec<_>>();
     run("systemctl", &args, None)?;
     Ok(())
+}
+
+fn systemd_unit_enabled(unit_name: &str) -> Result<bool> {
+    match systemctl(&["is-enabled", "--quiet", unit_name]) {
+        Ok(()) => Ok(true),
+        Err(Error::CommandFailed { code: Some(1), .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_systemd_state(
+    unit_name: &str,
+    unit_existed: bool,
+    was_enabled: bool,
+    was_running: bool,
+) -> Result<()> {
+    if !unit_existed {
+        systemctl(&["disable", "--now", unit_name])?;
+        return systemctl(&["daemon-reload"]);
+    }
+    systemctl(&["daemon-reload"])?;
+    let (enablement, activity) = systemd_restore_actions(was_enabled, was_running);
+    systemctl(&[enablement, unit_name])?;
+    systemctl(&[activity, unit_name])
+}
+
+fn systemd_restore_actions(was_enabled: bool, was_running: bool) -> (&'static str, &'static str) {
+    (
+        if was_enabled { "enable" } else { "disable" },
+        if was_running { "restart" } else { "stop" },
+    )
 }
 
 fn restore_service_file(path: &Path, previous: Option<&[u8]>) -> Result<()> {
@@ -159,7 +189,7 @@ fn rollback_service_file(
     }
     if let Err(reactivate) = reactivate_previous() {
         return Err(Error::DoctorFailed(format!(
-            "service install failed ({original}); the previous service file was restored but could not be restarted ({reactivate})"
+            "service install failed ({original}); the previous service file was restored but its service state could not be restored ({reactivate})"
         )));
     }
     Err(original)
@@ -197,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_removes_new_file_and_surfaces_restart_failure() {
+    fn rollback_removes_new_file_and_surfaces_state_restore_failure() {
         let root = test_dir("remove");
         create_owner_only_dir(&root).unwrap();
         let path = root.join("service");
@@ -209,10 +239,18 @@ mod tests {
             || Err(Error::DoctorFailed("restart failed".to_string())),
         );
         assert!(
-            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("could not be restarted"))
+            matches!(result, Err(Error::DoctorFailed(message)) if message.contains("service state could not be restored"))
         );
         assert!(!path.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn systemd_restore_matrix_preserves_enablement_and_running_state() {
+        assert_eq!(systemd_restore_actions(true, true), ("enable", "restart"));
+        assert_eq!(systemd_restore_actions(true, false), ("enable", "stop"));
+        assert_eq!(systemd_restore_actions(false, true), ("disable", "restart"));
+        assert_eq!(systemd_restore_actions(false, false), ("disable", "stop"));
     }
 
     fn test_dir(label: &str) -> std::path::PathBuf {

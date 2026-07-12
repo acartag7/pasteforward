@@ -8,8 +8,16 @@ if git ls-files --cached --others --exclude-standard -z \
   exit 1
 fi
 
-if grep -RInE 'uses: [^ ]+@([A-Za-z0-9_.-]+)$' .github/workflows 2>/dev/null \
-  | grep -Ev '@[0-9a-f]{40,}$'; then
+action_refs() {
+  sed -nE 's/^.*uses:[[:space:]]+[^@[:space:]]+@([^[:space:]#]+).*$/\1/p'
+}
+
+test "$(printf '%s\n' '  - uses: owner/action@v4 # mutable' | action_refs)" = "v4"
+test "$(printf '%s\n' '  - uses: owner/action@0123456789abcdef0123456789abcdef01234567 # pinned' | action_refs)" = "0123456789abcdef0123456789abcdef01234567"
+
+if grep -RInE 'uses:[[:space:]]+[^[:space:]]+@[^[:space:]#]+' .github/workflows 2>/dev/null \
+  | action_refs \
+  | grep -Ev '^[0-9a-f]{40,}$'; then
   echo "unpinned GitHub Action found" >&2
   exit 1
 fi
